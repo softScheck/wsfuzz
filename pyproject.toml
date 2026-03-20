@@ -1,0 +1,28 @@
+[project]
+name = "wsfuzz"
+version = "0.1.0"
+description = "WebSocket fuzzer using Radamsa for input mutation"
+requires-python = ">=3.14"
+dependencies = [
+    "websockets>=15.0",
+]
+
+[project.scripts]
+wsfuzz = "wsfuzz.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.15",
+    "ty>=0.0.23",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::RuntimeWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,22 @@
+target-version = "py314"
+
+[lint]
+select = [
+    "F",
+    "E",
+    "W",
+    "UP",
+    "RUF",
+    "DTZ",
+    "FBT",
+    "B",
+    "SIM",
+	"N", # PEP8-Naming https://docs.astral.sh/ruff/rules/#pep8-naming-n
+    "I", # Organized Imports
+]
+ignore = [
+    "E501", # https://docs.astral.sh/ruff/rules/line-too-long/
+    "D203", # https://docs.astral.sh/ruff/rules/one-blank-line-before-class/
+    "D212", # https://docs.astral.sh/ruff/rules/multi-line-summary-first-line/
+]
+

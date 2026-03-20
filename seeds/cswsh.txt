@@ -1,0 +1,4 @@
+GET / HTTP/1.1
+Origin: http://evil.example.com
+Cookie: session=stolen_token
+Authorization: Bearer invalid_token

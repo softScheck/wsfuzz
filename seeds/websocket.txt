@@ -1,0 +1,5 @@
+{"type":"subscribe","channel":"#general"}
+{"type":"auth","token":"eyJhbGciOiJIUzI1NiJ9.test.sig"}
+{"type":"ping","id":1}
+{"type":"message","to":"user_2","body":"hello"}
+42["event",{"key":"value"}]
