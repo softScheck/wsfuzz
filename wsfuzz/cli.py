@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 
 from wsfuzz.fuzzer import FuzzConfig, run
+from wsfuzz.harness import run_harness
 
 
 def main() -> None:
@@ -59,6 +60,22 @@ def main() -> None:
     )
     parser.add_argument("--origin", help="Origin header for CSWSH testing")
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
+    parser.add_argument(
+        "--harness",
+        action="store_true",
+        help="HTTP-to-WebSocket harness mode for external tools",
+    )
+    parser.add_argument(
+        "--harness-port",
+        type=int,
+        default=8765,
+        help="harness listen port (default: 8765)",
+    )
+    parser.add_argument(
+        "--harness-template",
+        metavar="TPL",
+        help='message template with [FUZZ] marker (e.g. \'{"id": "[FUZZ]"}\')',
+    )
 
     args = parser.parse_args()
 
@@ -95,6 +112,29 @@ def main() -> None:
         origin=args.origin,
         fuzz_handshake=args.fuzz_handshake,
     )
+
+    if args.harness:
+        import asyncio
+
+        opts = None
+        if headers or args.origin:
+            from wsfuzz.transport import ConnectOpts
+
+            opts = ConnectOpts(headers=headers, origin=args.origin)
+        try:
+            asyncio.run(
+                run_harness(
+                    args.target,
+                    mode=args.mode,
+                    timeout=args.timeout,
+                    opts=opts,
+                    template=args.harness_template,
+                    listen_port=args.harness_port,
+                )
+            )
+        except KeyboardInterrupt:
+            print("\ninterrupted")
+        return
 
     try:
         run(config)

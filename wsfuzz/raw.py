@@ -13,7 +13,7 @@ import struct
 import time
 from urllib.parse import urlparse
 
-from wsfuzz.transport import ConnectOpts, TransportResult
+from wsfuzz.transport import ConnectOpts, TransportResult, classify_error
 
 # Standard opcodes
 OP_CONTINUATION = 0x0
@@ -212,24 +212,5 @@ async def send_raw(
                 writer.close()
                 await writer.wait_closed()
 
-    except ConnectionRefusedError:
-        return TransportResult(
-            error="connection refused",
-            error_type="connection_refused",
-            duration_ms=_elapsed(),
-            connection_refused=True,
-        )
-    except ConnectionResetError:
-        return TransportResult(
-            error="connection reset by server",
-            error_type="connection_reset",
-            duration_ms=_elapsed(),
-        )
-    except TimeoutError:
-        return TransportResult(
-            error="timeout", error_type="timeout", duration_ms=_elapsed()
-        )
     except Exception as e:
-        return TransportResult(
-            error=str(e), error_type=type(e).__name__, duration_ms=_elapsed()
-        )
+        return classify_error(e, _elapsed())

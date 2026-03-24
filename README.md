@@ -37,6 +37,14 @@ wsfuzz -t ws://localhost:64999 --origin http://evil.example.com
 
 # Replay crashes for reproduction
 wsfuzz -t ws://localhost:64999 --replay ./crashes
+
+# HTTP-to-WebSocket harness — bridge for SQLMap, ffuf, Burp, nuclei
+wsfuzz -t ws://localhost:64999/api --harness
+# Then: sqlmap -u "http://127.0.0.1:8765" --data='{"id": "1"}' --batch
+# Or:   ffuf -u http://127.0.0.1:8765 -d 'FUZZ' -w wordlist.txt
+
+# Harness with template — inject into a specific JSON field
+wsfuzz -t ws://localhost:64999/api --harness --harness-template '{"user": "[FUZZ]"}'
 ```
 
 ## Options
@@ -71,6 +79,7 @@ wsfuzz -t ws://localhost:64999 --replay ./crashes
 **Application level**:
 - Mutation-based payload fuzzing via Radamsa
 - Crash detection via close codes >= 1002, connection resets, unhandled exceptions
+- Connection state classification: connection refused (including dual-stack IPv4+IPv6), resets, and timeouts are correctly identified and filtered — only genuine crashes are logged
 - Corpus feedback: crash payloads are added back to the seed pool
 - CSWSH: Origin header validation testing
 
@@ -88,4 +97,4 @@ The radamsa seed in the metadata file allows deterministic reproduction.
 uv run pytest
 ```
 
-122 tests covering transport, mutation, crash logging, protocol violations (RFC 6455), CSWSH, payload length mismatch, handshake fuzzing, and application-level vulnerabilities.
+162 tests covering transport, mutation, crash logging, protocol violations (RFC 6455), CSWSH, payload length mismatch, handshake fuzzing, connection state parity (normal vs raw mode), and application-level vulnerabilities.

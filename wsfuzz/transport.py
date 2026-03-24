@@ -28,6 +28,47 @@ def _handle_close(e: websockets.ConnectionClosed, elapsed_ms: float) -> Transpor
     return TransportResult(close_code=code, duration_ms=elapsed_ms)
 
 
+def classify_error(e: Exception, elapsed_ms: float) -> TransportResult:
+    """Classify a network exception into a TransportResult.
+
+    Shared by both normal (websockets) and raw (TCP) transport so that
+    error classification stays consistent across modes.
+    """
+    if isinstance(e, ConnectionRefusedError):
+        return TransportResult(
+            error="connection refused",
+            error_type="connection_refused",
+            duration_ms=elapsed_ms,
+            connection_refused=True,
+        )
+    if isinstance(e, ConnectionResetError):
+        return TransportResult(
+            error="connection reset by server",
+            error_type="connection_reset",
+            duration_ms=elapsed_ms,
+        )
+    if isinstance(e, TimeoutError):
+        return TransportResult(
+            error="timeout",
+            error_type="timeout",
+            duration_ms=elapsed_ms,
+        )
+    if isinstance(e, OSError):
+        err_str = str(e)
+        is_refused = "Connect call failed" in err_str or "Connection refused" in err_str
+        return TransportResult(
+            error=err_str,
+            error_type="connection_refused" if is_refused else "OSError",
+            duration_ms=elapsed_ms,
+            connection_refused=is_refused,
+        )
+    return TransportResult(
+        error=str(e),
+        error_type=type(e).__name__,
+        duration_ms=elapsed_ms,
+    )
+
+
 @dataclass
 class ConnectOpts:
     """Extra options for WebSocket connections."""
@@ -47,14 +88,6 @@ async def send_payload(
 
     def _elapsed() -> float:
         return (time.monotonic() - start) * 1000
-
-    def _error(msg: str, etype: str, *, refused: bool = False) -> TransportResult:
-        return TransportResult(
-            error=msg,
-            error_type=etype,
-            duration_ms=_elapsed(),
-            connection_refused=refused,
-        )
 
     extra_headers = {}
     if opts:
@@ -85,22 +118,8 @@ async def send_payload(
 
     except websockets.ConnectionClosed as e:
         return _handle_close(e, _elapsed())
-    except ConnectionRefusedError:
-        return _error("connection refused", "connection_refused", refused=True)
-    except ConnectionResetError:
-        return _error("connection reset by server", "connection_reset")
-    except TimeoutError:
-        return _error("timeout", "timeout")
-    except OSError as e:
-        err_str = str(e)
-        is_refused = "Connect call failed" in err_str or "Connection refused" in err_str
-        return _error(
-            err_str,
-            "connection_refused" if is_refused else "OSError",
-            refused=is_refused,
-        )
     except Exception as e:
-        return _error(str(e), type(e).__name__)
+        return classify_error(e, _elapsed())
 
 
 async def check_origin(uri: str, origin: str, timeout: float = 5.0) -> TransportResult:
