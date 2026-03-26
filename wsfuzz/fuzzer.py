@@ -1,5 +1,6 @@
 import asyncio
 import random
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +80,10 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
     if config.fuzz_handshake:
         print("handshake:  fuzz")
     print(f"crashes:    {config.log_dir}")
+    if not shutil.which(config.radamsa_path):
+        print(
+            "[!] radamsa not found — using random mutation (install: https://gitlab.com/akihe/radamsa)"
+        )
     print()
 
     start_time = time.monotonic()
