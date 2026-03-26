@@ -27,6 +27,7 @@ class FuzzConfig:
     headers: dict[str, str] = field(default_factory=dict)
     origin: str | None = None
     fuzz_handshake: bool = False
+    max_retries: int = 5
 
 
 def run(config: FuzzConfig) -> None:
@@ -81,11 +82,14 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
     print()
 
     start_time = time.monotonic()
+    consecutive_refused = 0
+    stop = False
 
     # Payload length mismatch values for testing buffer pre-allocation bugs
     length_mismatches = [0, 1, 125, 126, 65535, 65536, 2**31 - 1]
 
     async def _fuzz_one(iteration: int) -> None:
+        nonlocal consecutive_refused, stop
         seed_index = random.randrange(len(corpus))
         seed = corpus[seed_index]
         radamsa_seed = random.randint(0, 2**32 - 1)
@@ -123,10 +127,16 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
             )
 
         if result.connection_refused:
+            consecutive_refused += 1
             print(f"[!] connection refused - is the server running at {config.target}?")
-            if config.concurrency == 1:
+            if config.max_retries > 0 and consecutive_refused >= config.max_retries:
+                print(f"[!] giving up after {consecutive_refused} consecutive failures")
+                stop = True
+            else:
                 await asyncio.sleep(1)
             return
+
+        consecutive_refused = 0
 
         if logger.is_interesting(result):
             logger.log_crash(iteration, payload, result, seed_index, radamsa_seed)
@@ -139,7 +149,9 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
     iteration = 0
     try:
         if config.concurrency <= 1:
-            while config.iterations == 0 or iteration < config.iterations:
+            while not stop and (
+                config.iterations == 0 or iteration < config.iterations
+            ):
                 await _fuzz_one(iteration)
                 iteration += 1
                 if iteration % 100 == 0:
@@ -149,7 +161,9 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
                         f"[{iteration}] running... ({logger.crash_count} crashes, {rate:.1f} req/s)"
                     )
         else:
-            while config.iterations == 0 or iteration < config.iterations:
+            while not stop and (
+                config.iterations == 0 or iteration < config.iterations
+            ):
                 remaining = (
                     (config.iterations - iteration)
                     if config.iterations > 0

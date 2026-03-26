@@ -59,6 +59,12 @@ def main() -> None:
         help="custom header (repeatable)",
     )
     parser.add_argument("--origin", help="Origin header for CSWSH testing")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="stop after N consecutive connection refused errors (0 = never stop, default: 5)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
     parser.add_argument(
         "--harness",
@@ -111,6 +117,7 @@ def main() -> None:
         headers=headers,
         origin=args.origin,
         fuzz_handshake=args.fuzz_handshake,
+        max_retries=args.max_retries,
     )
 
     if args.harness:

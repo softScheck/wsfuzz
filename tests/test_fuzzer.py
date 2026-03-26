@@ -50,6 +50,31 @@ class TestFuzzerIntegration:
         assert "connection refused" in out
         assert "crashes:    0" in out
 
+    def test_fuzz_connection_refused_gives_up(self, tmp_path, capsys):
+        config = FuzzConfig(
+            target="ws://127.0.0.1:1",
+            iterations=0,
+            timeout=1.0,
+            log_dir=tmp_path / "crashes",
+            max_retries=2,
+        )
+        run(config)
+        out = capsys.readouterr().out
+        assert "giving up after 2 consecutive failures" in out
+
+    def test_fuzz_connection_refused_no_limit(self, tmp_path, capsys):
+        config = FuzzConfig(
+            target="ws://127.0.0.1:1",
+            iterations=2,
+            timeout=1.0,
+            log_dir=tmp_path / "crashes",
+            max_retries=0,
+        )
+        run(config)
+        out = capsys.readouterr().out
+        assert "giving up" not in out
+        assert "crashes:    0" in out
+
     def test_fuzz_with_empty_seeds(self, echo_server, tmp_path, capsys):
         empty_seeds = tmp_path / "empty_seeds"
         empty_seeds.mkdir()
