@@ -16,7 +16,7 @@ def mutate(
         result = subprocess.run(cmd, input=seed_data, capture_output=True, timeout=10)
         if result.returncode == 0 and result.stdout:
             return result.stdout
-    except subprocess.TimeoutExpired, FileNotFoundError, OSError:
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
 
     return os.urandom(len(seed_data) or 200)
@@ -40,7 +40,7 @@ async def mutate_async(
         stdout, _ = await asyncio.wait_for(proc.communicate(seed_data), timeout=10)
         if proc.returncode == 0 and stdout:
             return stdout
-    except TimeoutError, FileNotFoundError, OSError:
+    except (TimeoutError, FileNotFoundError, OSError):
         pass
 
     return os.urandom(len(seed_data) or 200)

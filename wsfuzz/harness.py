@@ -41,7 +41,7 @@ async def _handle_request(
     """Handle one HTTP request: read body, send over WS, return response."""
     try:
         headers_raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
-    except TimeoutError, ConnectionResetError, asyncio.IncompleteReadError:
+    except (TimeoutError, ConnectionResetError, asyncio.IncompleteReadError):
         writer.close()
         return
 
@@ -58,7 +58,7 @@ async def _handle_request(
             body = await asyncio.wait_for(
                 reader.readexactly(content_length), timeout=10
             )
-        except TimeoutError, asyncio.IncompleteReadError:
+        except (TimeoutError, asyncio.IncompleteReadError):
             writer.close()
             return
 
