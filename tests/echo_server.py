@@ -9,6 +9,7 @@ Supports multiple behaviors based on the path:
 """
 
 import asyncio
+import ssl
 
 import websockets
 from websockets import ServerConnection
@@ -38,5 +39,10 @@ async def echo_handler(ws: ServerConnection) -> None:
         await ws.send(msg)
 
 
-async def start_server(host: str = "127.0.0.1", port: int = 0) -> websockets.Server:
-    return await websockets.serve(echo_handler, host, port)
+async def start_server(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    *,
+    ssl_context: ssl.SSLContext | None = None,
+) -> websockets.Server:
+    return await websockets.serve(echo_handler, host, port, ssl=ssl_context)

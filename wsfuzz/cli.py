@@ -3,6 +3,7 @@ from pathlib import Path
 
 from wsfuzz.fuzzer import FuzzConfig, run
 from wsfuzz.harness import run_harness
+from wsfuzz.transport import make_connect_opts
 
 
 def main() -> None:
@@ -60,6 +61,16 @@ def main() -> None:
     )
     parser.add_argument("--origin", help="Origin header for CSWSH testing")
     parser.add_argument(
+        "--tls-ca",
+        metavar="FILE",
+        help="custom CA bundle for wss:// connections",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="disable TLS certificate verification for wss:// connections",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=5,
@@ -84,6 +95,8 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.fuzz_handshake and not args.raw:
+        parser.error("--fuzz-handshake requires --raw")
 
     replay_files: list[Path] = []
     if args.replay:
@@ -116,6 +129,8 @@ def main() -> None:
         replay=replay_files,
         headers=headers,
         origin=args.origin,
+        ca_file=args.tls_ca,
+        insecure=args.insecure,
         fuzz_handshake=args.fuzz_handshake,
         max_retries=args.max_retries,
     )
@@ -123,11 +138,12 @@ def main() -> None:
     if args.harness:
         import asyncio
 
-        opts = None
-        if headers or args.origin:
-            from wsfuzz.transport import ConnectOpts
-
-            opts = ConnectOpts(headers=headers, origin=args.origin)
+        opts = make_connect_opts(
+            headers,
+            args.origin,
+            ca_file=args.tls_ca,
+            insecure=args.insecure,
+        )
         try:
             asyncio.run(
                 run_harness(

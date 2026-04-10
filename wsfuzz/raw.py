@@ -7,13 +7,21 @@ RSV bit abuse, fragmentation violations, payload length mismatches, etc.
 
 import asyncio
 import base64
+import hashlib
 import os
 import random
+import ssl
 import struct
 import time
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from wsfuzz.transport import ConnectOpts, TransportResult, classify_error
+from wsfuzz.transport import (
+    ConnectOpts,
+    TransportResult,
+    classify_error,
+    make_ssl_context,
+)
 
 # Standard opcodes
 OP_CONTINUATION = 0x0
@@ -34,6 +42,25 @@ _FUZZ_EXTENSIONS = [
     "A" * 500,
 ]
 _FUZZ_PROTOCOLS = ["", "chat", "graphql-ws", "mqtt", "x-invalid", "A" * 500]
+
+
+@dataclass(frozen=True)
+class HandshakeFuzz:
+    version: str
+    extension: str | None = None
+    protocol: str | None = None
+
+
+def make_handshake_fuzz(*, enabled: bool) -> HandshakeFuzz | None:
+    if not enabled:
+        return None
+    extension = random.choice(_FUZZ_EXTENSIONS) or None
+    protocol = random.choice(_FUZZ_PROTOCOLS) or None
+    return HandshakeFuzz(
+        version=random.choice(_FUZZ_VERSIONS),
+        extension=extension,
+        protocol=protocol,
+    )
 
 
 def build_frame(
@@ -126,25 +153,21 @@ def _build_handshake(
     key: str,
     opts: ConnectOpts | None = None,
     *,
-    fuzz_handshake: bool = False,
+    handshake_fuzz: HandshakeFuzz | None = None,
 ) -> str:
     """Build the HTTP upgrade request for the WebSocket handshake."""
-    version = random.choice(_FUZZ_VERSIONS) if fuzz_handshake else "13"
     lines = [
         f"GET {path} HTTP/1.1",
         f"Host: {host}:{port}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",
-        f"Sec-WebSocket-Version: {version}",
+        f"Sec-WebSocket-Version: {handshake_fuzz.version if handshake_fuzz else '13'}",
     ]
-    if fuzz_handshake:
-        ext = random.choice(_FUZZ_EXTENSIONS)
-        if ext:
-            lines.append(f"Sec-WebSocket-Extensions: {ext}")
-        proto = random.choice(_FUZZ_PROTOCOLS)
-        if proto:
-            lines.append(f"Sec-WebSocket-Protocol: {proto}")
+    if handshake_fuzz and handshake_fuzz.extension:
+        lines.append(f"Sec-WebSocket-Extensions: {handshake_fuzz.extension}")
+    if handshake_fuzz and handshake_fuzz.protocol:
+        lines.append(f"Sec-WebSocket-Protocol: {handshake_fuzz.protocol}")
     if opts:
         if opts.origin:
             lines.append(f"Origin: {opts.origin}")
@@ -155,6 +178,63 @@ def _build_handshake(
     return "\r\n".join(lines)
 
 
+def _request_target(parsed) -> str:
+    path = parsed.path or "/"
+    if parsed.query:
+        return f"{path}?{parsed.query}"
+    return path
+
+
+def _handshake_succeeded(response: bytes) -> bool:
+    status_line = response.split(b"\r\n", 1)[0]
+    parts = status_line.split(None, 2)
+    return len(parts) >= 2 and parts[1] == b"101"
+
+
+def _expected_accept(key: str) -> str:
+    digest = hashlib.sha1(
+        (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+    ).digest()
+    return base64.b64encode(digest).decode()
+
+
+def _parse_handshake_headers(response: bytes) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for line in response.split(b"\r\n")[1:]:
+        if not line or b":" not in line:
+            continue
+        key, value = line.split(b":", 1)
+        header_name = key.decode("ascii", errors="ignore").lower()
+        header_value = value.decode("ascii", errors="ignore").strip()
+        if header_name in headers:
+            headers[header_name] = f"{headers[header_name]},{header_value}"
+        else:
+            headers[header_name] = header_value
+    return headers
+
+
+def _validate_handshake(response: bytes, key: str) -> str | None:
+    if not _handshake_succeeded(response):
+        return "status is not 101"
+
+    headers = _parse_handshake_headers(response)
+    if headers.get("upgrade", "").lower() != "websocket":
+        return "missing Upgrade: websocket"
+
+    connection_tokens = {
+        token.strip().lower()
+        for token in headers.get("connection", "").split(",")
+        if token.strip()
+    }
+    if "upgrade" not in connection_tokens:
+        return "missing Connection: Upgrade"
+
+    if headers.get("sec-websocket-accept") != _expected_accept(key):
+        return "invalid Sec-WebSocket-Accept"
+
+    return None
+
+
 async def send_raw(
     uri: str,
     frame: bytes,
@@ -162,32 +242,55 @@ async def send_raw(
     opts: ConnectOpts | None = None,
     *,
     fuzz_handshake: bool = False,
+    handshake_fuzz: HandshakeFuzz | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> TransportResult:
     """TCP connect, WS handshake, send raw frame, read response."""
     parsed = urlparse(uri)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
-    path = parsed.path or "/"
+    path = _request_target(parsed)
     start = time.monotonic()
 
     def _elapsed() -> float:
         return (time.monotonic() - start) * 1000
 
     try:
+        tls_context = make_ssl_context(uri, opts, ssl_context)
+        server_hostname = None
+        if tls_context is not None:
+            server_hostname = host
         async with asyncio.timeout(timeout):
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.open_connection(
+                host,
+                port,
+                ssl=tls_context,
+                server_hostname=server_hostname,
+            )
             try:
                 key = base64.b64encode(os.urandom(16)).decode()
+                selected_handshake_fuzz = handshake_fuzz or make_handshake_fuzz(
+                    enabled=fuzz_handshake
+                )
                 request = _build_handshake(
-                    host, port, path, key, opts, fuzz_handshake=fuzz_handshake
+                    host,
+                    port,
+                    path,
+                    key,
+                    opts,
+                    handshake_fuzz=selected_handshake_fuzz,
                 )
                 writer.write(request.encode())
                 await writer.drain()
 
                 response = await reader.readuntil(b"\r\n\r\n")
-                if b"101" not in response:
+                handshake_error = _validate_handshake(response, key)
+                if handshake_error is not None:
                     return TransportResult(
-                        error=f"handshake failed: {response[:80].decode(errors='replace')}",
+                        error=(
+                            f"handshake failed: {handshake_error}: "
+                            f"{response[:80].decode(errors='replace')}"
+                        ),
                         error_type="handshake_failed",
                         duration_ms=_elapsed(),
                     )

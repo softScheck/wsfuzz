@@ -1,6 +1,8 @@
 import asyncio
+import ssl
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import websockets
 
@@ -75,6 +77,44 @@ class ConnectOpts:
 
     headers: dict[str, str] = field(default_factory=dict)
     origin: str | None = None
+    ca_file: str | None = None
+    insecure: bool = False
+
+
+def make_connect_opts(
+    headers: dict[str, str] | None = None,
+    origin: str | None = None,
+    *,
+    ca_file: str | None = None,
+    insecure: bool = False,
+) -> ConnectOpts | None:
+    """Create ConnectOpts only when custom handshake options are present."""
+    if not headers and origin is None and ca_file is None and not insecure:
+        return None
+    return ConnectOpts(
+        headers=dict(headers or {}),
+        origin=origin,
+        ca_file=ca_file,
+        insecure=insecure,
+    )
+
+
+def make_ssl_context(
+    uri: str,
+    opts: ConnectOpts | None = None,
+    override: ssl.SSLContext | None = None,
+) -> ssl.SSLContext | None:
+    """Create an SSL context for wss:// targets.
+
+    Returns None for ws:// targets.
+    """
+    if urlparse(uri).scheme != "wss":
+        return None
+    if override is not None:
+        return override
+    if opts and opts.insecure:
+        return ssl._create_unverified_context()
+    return ssl.create_default_context(cafile=opts.ca_file if opts else None)
 
 
 async def send_payload(
@@ -96,12 +136,14 @@ async def send_payload(
             extra_headers["Origin"] = opts.origin
 
     try:
+        ssl_context = make_ssl_context(uri, opts)
         async with asyncio.timeout(timeout):
             async with websockets.connect(
                 uri,
                 open_timeout=timeout,
                 close_timeout=timeout,
                 additional_headers=extra_headers or None,
+                ssl=ssl_context,
             ) as ws:
                 if mode == "text":
                     await ws.send(payload.decode(errors="replace"))

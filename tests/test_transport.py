@@ -1,7 +1,7 @@
 import asyncio
 import os
 
-from wsfuzz.transport import TransportResult, send_payload
+from wsfuzz.transport import ConnectOpts, TransportResult, send_payload
 
 
 class TestTransportResult:
@@ -81,3 +81,44 @@ class TestSendPayload:
         )
         assert result.error is None
         assert result.response == payload
+
+    def test_wss_with_custom_ca(self, tls_echo_server):
+        payload = b"hello over tls"
+        result = asyncio.run(
+            send_payload(
+                tls_echo_server.uri + "/echo",
+                payload,
+                "binary",
+                5.0,
+                ConnectOpts(ca_file=str(tls_echo_server.cert_path)),
+            )
+        )
+        assert result.error is None
+        assert result.response == payload
+
+    def test_wss_with_insecure(self, tls_echo_server):
+        payload = b"insecure tls"
+        result = asyncio.run(
+            send_payload(
+                tls_echo_server.uri + "/echo",
+                payload,
+                "binary",
+                5.0,
+                ConnectOpts(insecure=True),
+            )
+        )
+        assert result.error is None
+        assert result.response == payload
+
+    def test_wss_with_missing_ca_is_classified(self, tls_echo_server):
+        result = asyncio.run(
+            send_payload(
+                tls_echo_server.uri + "/echo",
+                b"test",
+                "binary",
+                5.0,
+                ConnectOpts(ca_file="/nonexistent/ca.pem"),
+            )
+        )
+        assert isinstance(result, TransportResult)
+        assert result.error is not None

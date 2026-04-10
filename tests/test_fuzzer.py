@@ -1,7 +1,10 @@
+import asyncio
 import time
 from pathlib import Path
 
 from wsfuzz.fuzzer import FuzzConfig, run
+from wsfuzz.raw import HandshakeFuzz
+from wsfuzz.transport import TransportResult
 
 
 class TestFuzzerIntegration:
@@ -163,41 +166,235 @@ class TestReplay:
         out = capsys.readouterr().out
         assert "crash_0_1.bin" in out
 
+    def test_replay_raw_resends_saved_frame_bytes(self, tmp_path, monkeypatch):
+        crash_file = tmp_path / "crash_0_1.bin"
+        crash_file.write_bytes(b"raw-frame-bytes")
+        seen: dict[str, object] = {}
+
+        async def fake_send_raw(
+            target,
+            frame,
+            timeout,
+            opts,
+            *,
+            fuzz_handshake=False,
+            handshake_fuzz=None,
+            ssl_context=None,
+        ):
+            seen["target"] = target
+            seen["frame"] = frame
+            seen["timeout"] = timeout
+            seen["opts"] = opts
+            seen["fuzz_handshake"] = fuzz_handshake
+            seen["handshake_fuzz"] = handshake_fuzz
+            return TransportResult(duration_ms=1.0)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.send_raw", fake_send_raw)
+
+        run(
+            FuzzConfig(
+                target="ws://example.test/socket",
+                timeout=2.0,
+                log_dir=tmp_path / "unused",
+                raw=True,
+                replay=[crash_file],
+            )
+        )
+
+        assert seen == {
+            "target": "ws://example.test/socket",
+            "frame": b"raw-frame-bytes",
+            "timeout": 2.0,
+            "opts": None,
+            "fuzz_handshake": False,
+            "handshake_fuzz": None,
+        }
+
+    def test_replay_raw_uses_saved_handshake_fuzz_metadata(self, tmp_path, monkeypatch):
+        crash_file = tmp_path / "crash_0_1.bin"
+        crash_file.write_bytes(b"raw-frame-bytes")
+        crash_file.with_suffix(".txt").write_text(
+            "handshake_fuzz: true\n"
+            "handshake_version: 99\n"
+            "handshake_extension: permessage-deflate\n"
+            "handshake_protocol: chat\n"
+        )
+        seen: dict[str, object] = {}
+
+        async def fake_send_raw(
+            target,
+            frame,
+            timeout,
+            opts,
+            *,
+            fuzz_handshake=False,
+            handshake_fuzz=None,
+            ssl_context=None,
+        ):
+            seen["handshake_fuzz"] = handshake_fuzz
+            return TransportResult(duration_ms=1.0)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.send_raw", fake_send_raw)
+
+        run(
+            FuzzConfig(
+                target="ws://example.test/socket",
+                timeout=2.0,
+                log_dir=tmp_path / "unused",
+                raw=True,
+                replay=[crash_file],
+            )
+        )
+
+        assert seen["handshake_fuzz"] == HandshakeFuzz(
+            version="99",
+            extension="permessage-deflate",
+            protocol="chat",
+        )
+
+
+class TestRawCrashReplayability:
+    def test_raw_mode_logs_frame_bytes(self, tmp_path, monkeypatch):
+        seed_dir = tmp_path / "seeds"
+        seed_dir.mkdir()
+        (seed_dir / "seed.bin").write_bytes(b"seed")
+
+        async def fake_mutate_async(seed_data, radamsa_path="radamsa", seed_num=None):
+            return b"payload"
+
+        async def fake_send_raw(
+            uri,
+            frame,
+            timeout=5.0,
+            opts=None,
+            *,
+            fuzz_handshake=False,
+            handshake_fuzz=None,
+            ssl_context=None,
+        ):
+            return TransportResult(
+                error="boom",
+                error_type="boom",
+                duration_ms=1.0,
+            )
+
+        monkeypatch.setattr("wsfuzz.fuzzer.mutate_async", fake_mutate_async)
+        monkeypatch.setattr("wsfuzz.fuzzer.build_frame", lambda *args, **kwargs: b"F")
+        monkeypatch.setattr("wsfuzz.fuzzer.send_raw", fake_send_raw)
+
+        run(
+            FuzzConfig(
+                target="ws://example.test/socket",
+                seeds_dir=seed_dir,
+                iterations=1,
+                timeout=1.0,
+                log_dir=tmp_path / "crashes",
+                raw=True,
+            )
+        )
+
+        crash_files = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_files) == 1
+        assert crash_files[0].read_bytes() == b"F"
+
+    def test_raw_handshake_fuzz_metadata_is_logged(self, tmp_path, monkeypatch):
+        seed_dir = tmp_path / "seeds"
+        seed_dir.mkdir()
+        (seed_dir / "seed.bin").write_bytes(b"seed")
+
+        async def fake_mutate_async(seed_data, radamsa_path="radamsa", seed_num=None):
+            return b"payload"
+
+        async def fake_send_raw(
+            uri,
+            frame,
+            timeout=5.0,
+            opts=None,
+            *,
+            fuzz_handshake=False,
+            handshake_fuzz=None,
+            ssl_context=None,
+        ):
+            return TransportResult(error="boom", error_type="boom", duration_ms=1.0)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.mutate_async", fake_mutate_async)
+        monkeypatch.setattr("wsfuzz.fuzzer.build_frame", lambda *args, **kwargs: b"F")
+        monkeypatch.setattr(
+            "wsfuzz.fuzzer.make_handshake_fuzz",
+            lambda enabled: (
+                HandshakeFuzz(
+                    version="99",
+                    extension="permessage-deflate",
+                    protocol="chat",
+                )
+                if enabled
+                else None
+            ),
+        )
+        monkeypatch.setattr("wsfuzz.fuzzer.send_raw", fake_send_raw)
+
+        run(
+            FuzzConfig(
+                target="ws://example.test/socket",
+                seeds_dir=seed_dir,
+                iterations=1,
+                timeout=1.0,
+                log_dir=tmp_path / "crashes",
+                raw=True,
+                fuzz_handshake=True,
+            )
+        )
+
+        crash_txt = next((tmp_path / "crashes").glob("crash_*.txt")).read_text()
+        assert "handshake_fuzz: true" in crash_txt
+        assert "handshake_version: 99" in crash_txt
+        assert "handshake_extension: permessage-deflate" in crash_txt
+        assert "handshake_protocol: chat" in crash_txt
+
 
 class TestConcurrency:
-    def test_concurrent_faster_than_sequential(self, echo_server, tmp_path):
-        """Concurrent fuzzing should be faster than sequential."""
-        seeds_dir = Path(__file__).parent.parent / "seeds"
-        n = 20
+    def test_concurrent_overlaps_work(self, tmp_path, monkeypatch):
+        """Concurrent fuzzing should overlap async work instead of serializing it."""
+        active = 0
+        max_active = 0
 
-        start = time.monotonic()
-        run(
-            FuzzConfig(
-                target=echo_server,
-                iterations=n,
-                timeout=2.0,
-                seeds_dir=seeds_dir,
-                log_dir=tmp_path / "seq",
-                concurrency=1,
+        async def fake_mutate_async(seed_data, radamsa_path="radamsa", seed_num=None):
+            return b"x"
+
+        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.05)
+                return TransportResult(response=b"ok", duration_ms=50.0)
+            finally:
+                active -= 1
+
+        monkeypatch.setattr("wsfuzz.fuzzer.mutate_async", fake_mutate_async)
+        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
+
+        def run_case(concurrency: int, log_dir: Path) -> tuple[float, int]:
+            nonlocal max_active
+            max_active = 0
+            start = time.monotonic()
+            run(
+                FuzzConfig(
+                    target="ws://example.test/socket",
+                    iterations=10,
+                    timeout=1.0,
+                    log_dir=log_dir,
+                    concurrency=concurrency,
+                )
             )
-        )
-        seq_ms = (time.monotonic() - start) * 1000
+            return (time.monotonic() - start) * 1000, max_active
 
-        start = time.monotonic()
-        run(
-            FuzzConfig(
-                target=echo_server,
-                iterations=n,
-                timeout=2.0,
-                seeds_dir=seeds_dir,
-                log_dir=tmp_path / "con",
-                concurrency=10,
-            )
-        )
-        con_ms = (time.monotonic() - start) * 1000
+        seq_ms, seq_max_active = run_case(1, tmp_path / "seq")
+        con_ms, con_max_active = run_case(5, tmp_path / "con")
 
-        # Concurrent should be at least somewhat faster
-        assert con_ms < seq_ms * 1.5, (
+        assert seq_max_active == 1
+        assert con_max_active > 1
+        assert con_ms < seq_ms * 0.7, (
             f"concurrent={con_ms:.0f}ms, sequential={seq_ms:.0f}ms"
         )
 

@@ -58,28 +58,83 @@ class TestMutateAsync:
         assert isinstance(result, bytes)
         assert len(result) == 5
 
-    def test_async_concurrent_is_faster(self):
-        """Concurrent async mutations should be faster than sequential."""
-        import time
+    def test_async_timeout_kills_subprocess(self, monkeypatch):
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+                self.waited = False
 
-        seed = b"test data for concurrent mutation benchmark"
+            async def communicate(self, _seed_data: bytes):
+                return b"", b""
 
-        start = time.monotonic()
-        for i in range(20):
-            mutate(seed, seed_num=i)
-        sync_ms = (time.monotonic() - start) * 1000
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
 
-        async def concurrent():
+            async def wait(self):
+                self.waited = True
+
+        proc = FakeProc()
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return proc
+
+        async def fake_wait_for(awaitable, timeout):
+            await awaitable
+            raise TimeoutError
+
+        monkeypatch.setattr(
+            "wsfuzz.mutator.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        monkeypatch.setattr("wsfuzz.mutator.asyncio.wait_for", fake_wait_for)
+
+        result = asyncio.run(mutate_async(b"hello"))
+
+        assert isinstance(result, bytes)
+        assert len(result) == 5
+        assert proc.killed is True
+        assert proc.waited is True
+
+    def test_async_concurrent_overlaps_work(self, monkeypatch):
+        """Concurrent async mutations should overlap subprocess work."""
+
+        active = 0
+        max_active = 0
+
+        class FakeProc:
+            def __init__(self):
+                self.returncode = 0
+
+            async def communicate(self, seed_data: bytes):
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                try:
+                    await asyncio.sleep(0.05)
+                    return seed_data + b"-mutated", b""
+                finally:
+                    active -= 1
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "wsfuzz.mutator.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+
+        async def run_many():
             return await asyncio.gather(
-                *[mutate_async(seed, seed_num=i) for i in range(20)]
+                *[mutate_async(b"seed", seed_num=i) for i in range(10)]
             )
 
-        start = time.monotonic()
-        asyncio.run(concurrent())
-        async_ms = (time.monotonic() - start) * 1000
+        results = asyncio.run(run_many())
 
-        # Concurrent should be at least somewhat faster
-        assert async_ms < sync_ms * 1.5  # generous margin for CI
+        assert max_active > 1
+        assert len(results) == 10
+        assert all(result == b"seed-mutated" for result in results)
 
 
 class TestLoadSeeds:

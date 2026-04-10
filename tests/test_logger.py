@@ -98,6 +98,26 @@ class TestLogCrash:
         assert logger.crash_count == 5
         assert logger.error_types["SomeError"] == 5
 
+    def test_writes_extra_metadata(self, tmp_path):
+        logger = CrashLogger(tmp_path)
+        result = TransportResult(error="err", error_type="SomeError")
+        logger.log_crash(
+            0,
+            b"x",
+            result,
+            0,
+            1,
+            extra_metadata={
+                "handshake_fuzz": "true",
+                "handshake_version": "99",
+                "handshake_extension": "",
+            },
+        )
+
+        txt = next(tmp_path.glob("crash_0_*.txt")).read_text()
+        assert "handshake_fuzz: true" in txt
+        assert "handshake_version: 99" in txt
+
 
 class TestSummary:
     def test_summary_with_crashes(self, tmp_path):

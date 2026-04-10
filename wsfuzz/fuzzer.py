@@ -7,8 +7,15 @@ from pathlib import Path
 
 from wsfuzz.logger import CrashLogger
 from wsfuzz.mutator import load_seeds, mutate_async
-from wsfuzz.raw import OP_BINARY, OP_TEXT, build_frame, send_raw
-from wsfuzz.transport import ConnectOpts, send_payload
+from wsfuzz.raw import (
+    OP_BINARY,
+    OP_TEXT,
+    HandshakeFuzz,
+    build_frame,
+    make_handshake_fuzz,
+    send_raw,
+)
+from wsfuzz.transport import make_connect_opts, send_payload
 
 
 @dataclass
@@ -27,18 +34,39 @@ class FuzzConfig:
     replay: list[Path] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
     origin: str | None = None
+    ca_file: str | None = None
+    insecure: bool = False
     fuzz_handshake: bool = False
     max_retries: int = 5
 
 
 def run(config: FuzzConfig) -> None:
+    if config.fuzz_handshake and not config.raw:
+        raise ValueError("--fuzz-handshake requires raw mode")
     asyncio.run(_fuzz_loop(config))
 
 
-def _opts(config: FuzzConfig) -> ConnectOpts | None:
-    if config.headers or config.origin:
-        return ConnectOpts(headers=config.headers, origin=config.origin)
-    return None
+def _load_metadata(path: Path) -> dict[str, str]:
+    metadata_path = path.with_suffix(".txt")
+    if not metadata_path.is_file():
+        return {}
+    metadata: dict[str, str] = {}
+    for line in metadata_path.read_text().splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            metadata[key.strip()] = value.lstrip()
+    return metadata
+
+
+def _load_handshake_fuzz(path: Path) -> HandshakeFuzz | None:
+    metadata = _load_metadata(path)
+    if metadata.get("handshake_fuzz") != "true":
+        return None
+    return HandshakeFuzz(
+        version=metadata.get("handshake_version", "13"),
+        extension=metadata.get("handshake_extension") or None,
+        protocol=metadata.get("handshake_protocol") or None,
+    )
 
 
 async def _replay(config: FuzzConfig) -> None:
@@ -48,11 +76,23 @@ async def _replay(config: FuzzConfig) -> None:
     print(f"files:   {len(config.replay)}")
     print()
 
-    opts = _opts(config)
+    opts = make_connect_opts(
+        config.headers,
+        config.origin,
+        ca_file=config.ca_file,
+        insecure=config.insecure,
+    )
     for path in config.replay:
         payload = path.read_bytes()
         if config.raw:
-            result = await send_raw(config.target, payload, config.timeout, opts)
+            handshake_fuzz = _load_handshake_fuzz(path)
+            result = await send_raw(
+                config.target,
+                payload,
+                config.timeout,
+                opts,
+                handshake_fuzz=handshake_fuzz,
+            )
         else:
             result = await send_payload(
                 config.target, payload, config.mode, config.timeout, opts
@@ -69,7 +109,12 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
 
     corpus = load_seeds(config.seeds_dir)
     logger = CrashLogger(config.log_dir)
-    opts = _opts(config)
+    opts = make_connect_opts(
+        config.headers,
+        config.origin,
+        ca_file=config.ca_file,
+        insecure=config.insecure,
+    )
 
     print("wsfuzz - WebSocket Fuzzer")
     print(f"target:     {config.target}")
@@ -103,12 +148,15 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
         if len(payload) > config.max_size:
             payload = payload[: config.max_size]
 
+        sent_payload = payload
+        handshake_fuzz: HandshakeFuzz | None = None
         if config.raw:
             opcode = OP_TEXT if config.mode == "text" else OP_BINARY
             # ~5% chance of payload length mismatch to test buffer pre-allocation
             fake_length = (
                 random.choice(length_mismatches) if random.random() < 0.05 else None
             )
+            handshake_fuzz = make_handshake_fuzz(enabled=config.fuzz_handshake)
             frame = build_frame(
                 payload,
                 opcode=random.choice([opcode, *range(3, 8), *range(0xB, 0x10)]),
@@ -119,12 +167,14 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
                 rsv3=random.random() > 0.9,
                 fake_length=fake_length,
             )
+            # Persist the exact frame bytes so raw-mode crash files are replayable.
+            sent_payload = frame
             result = await send_raw(
                 config.target,
                 frame,
                 config.timeout,
                 opts,
-                fuzz_handshake=config.fuzz_handshake,
+                handshake_fuzz=handshake_fuzz,
             )
         else:
             result = await send_payload(
@@ -144,10 +194,25 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
         consecutive_refused = 0
 
         if logger.is_interesting(result):
-            logger.log_crash(iteration, payload, result, seed_index, radamsa_seed)
+            extra_metadata: dict[str, str] = {}
+            if handshake_fuzz is not None:
+                extra_metadata = {
+                    "handshake_fuzz": "true",
+                    "handshake_version": handshake_fuzz.version,
+                    "handshake_extension": handshake_fuzz.extension or "",
+                    "handshake_protocol": handshake_fuzz.protocol or "",
+                }
+            logger.log_crash(
+                iteration,
+                sent_payload,
+                result,
+                seed_index,
+                radamsa_seed,
+                extra_metadata=extra_metadata,
+            )
             corpus.append(payload)
             msg = f"[CRASH] #{iteration} {result.error_type}: {result.error}"
-            print(f"{msg} ({len(payload)}b, {result.duration_ms:.0f}ms)")
+            print(f"{msg} ({len(sent_payload)}b, {result.duration_ms:.0f}ms)")
         elif config.verbose:
             print(f"[{iteration}] ok ({len(payload)}b, {result.duration_ms:.0f}ms)")
 

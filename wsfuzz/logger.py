@@ -1,5 +1,6 @@
 import time
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 
 from wsfuzz.transport import TransportResult
@@ -24,6 +25,7 @@ class CrashLogger:
         result: TransportResult,
         seed_index: int,
         radamsa_seed: int,
+        extra_metadata: Mapping[str, str] | None = None,
     ) -> None:
         self.crash_count += 1
         if result.error_type:
@@ -33,16 +35,19 @@ class CrashLogger:
         base = f"crash_{iteration}_{ts}"
 
         (self.log_dir / f"{base}.bin").write_bytes(payload)
-        (self.log_dir / f"{base}.txt").write_text(
-            f"iteration: {iteration}\n"
-            f"seed_index: {seed_index}\n"
-            f"radamsa_seed: {radamsa_seed}\n"
-            f"error_type: {result.error_type}\n"
-            f"error: {result.error}\n"
-            f"duration_ms: {result.duration_ms:.1f}\n"
-            f"payload_size: {len(payload)}\n"
-            f"response: {result.response!r}\n"
-        )
+        metadata = [
+            f"iteration: {iteration}",
+            f"seed_index: {seed_index}",
+            f"radamsa_seed: {radamsa_seed}",
+            f"error_type: {result.error_type}",
+            f"error: {result.error}",
+            f"duration_ms: {result.duration_ms:.1f}",
+            f"payload_size: {len(payload)}",
+            f"response: {result.response!r}",
+        ]
+        if extra_metadata:
+            metadata.extend(f"{key}: {value}" for key, value in extra_metadata.items())
+        (self.log_dir / f"{base}.txt").write_text("\n".join(metadata) + "\n")
 
     def summary(self, total_iterations: int) -> str:
         lines = [
