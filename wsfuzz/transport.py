@@ -1,10 +1,21 @@
 import asyncio
+import re
 import ssl
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import websockets
+
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_CONTROL_CHARS = frozenset(
+    chr(code)
+    for code in [*range(0x00, 0x09), *range(0x0B, 0x0D), *range(0x0E, 0x20), 0x7F]
+)
+
+
+class TransportConfigError(ValueError):
+    pass
 
 
 @dataclass
@@ -17,7 +28,42 @@ class TransportResult:
     connection_refused: bool = False
 
 
-def _handle_close(e: websockets.ConnectionClosed, elapsed_ms: float) -> TransportResult:
+def validate_ws_uri(uri: str) -> None:
+    if any(char in uri for char in "\r\n"):
+        raise ValueError("target must not contain newlines")
+    if any(char in uri for char in " \t"):
+        raise ValueError("target must not contain whitespace")
+    if contains_control_chars(uri):
+        raise ValueError("target must not contain control characters")
+    try:
+        parsed = urlparse(uri)
+    except ValueError as exc:
+        raise ValueError("target must be a valid ws:// or wss:// URL") from exc
+    if parsed.scheme not in {"ws", "wss"} or not parsed.netloc:
+        raise ValueError("target must be a ws:// or wss:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("target must not contain userinfo")
+    if parsed.hostname is None:
+        raise ValueError("target must include a host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("target port must be between 1 and 65535") from exc
+    if port == 0:
+        raise ValueError("target port must be between 1 and 65535")
+    if parsed.fragment:
+        raise ValueError("target must not contain fragments")
+
+
+def is_http_token(value: str) -> bool:
+    return _HTTP_TOKEN_RE.fullmatch(value) is not None
+
+
+def contains_control_chars(value: str) -> bool:
+    return any(char in _CONTROL_CHARS for char in value)
+
+
+def handle_close(e: websockets.ConnectionClosed, elapsed_ms: float) -> TransportResult:
     code = e.rcvd.code if e.rcvd else None
     reason = e.rcvd.reason if e.rcvd else ""
     if code and code >= 1002:
@@ -36,6 +82,12 @@ def classify_error(e: Exception, elapsed_ms: float) -> TransportResult:
     Shared by both normal (websockets) and raw (TCP) transport so that
     error classification stays consistent across modes.
     """
+    if isinstance(e, TransportConfigError):
+        return TransportResult(
+            error=str(e),
+            error_type="transport_config",
+            duration_ms=elapsed_ms,
+        )
     if isinstance(e, ConnectionRefusedError):
         return TransportResult(
             error="connection refused",
@@ -91,12 +143,39 @@ def make_connect_opts(
     """Create ConnectOpts only when custom handshake options are present."""
     if not headers and origin is None and ca_file is None and not insecure:
         return None
-    return ConnectOpts(
+    opts = ConnectOpts(
         headers=dict(headers or {}),
         origin=origin,
         ca_file=ca_file,
         insecure=insecure,
     )
+    validate_connect_opts(opts)
+    return opts
+
+
+def validate_connect_opts(opts: ConnectOpts | None) -> None:
+    if opts is None:
+        return
+    _validate_connect_headers(opts.headers)
+    if opts.origin is not None:
+        if any(char in opts.origin for char in "\r\n"):
+            raise TransportConfigError("origin must not contain newlines")
+        if contains_control_chars(opts.origin):
+            raise TransportConfigError("origin must not contain control characters")
+
+
+def _validate_connect_headers(headers: dict[str, str]) -> None:
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise TransportConfigError("headers must be strings")
+        if not key.strip():
+            raise TransportConfigError("header names must not be empty")
+        if not is_http_token(key) or key != key.strip():
+            raise TransportConfigError("header names must be valid HTTP tokens")
+        if any(char in value for char in "\r\n"):
+            raise TransportConfigError("headers must not contain newlines")
+        if contains_control_chars(value):
+            raise TransportConfigError("headers must not contain control characters")
 
 
 def make_ssl_context(
@@ -114,7 +193,36 @@ def make_ssl_context(
         return override
     if opts and opts.insecure:
         return ssl._create_unverified_context()
-    return ssl.create_default_context(cafile=opts.ca_file if opts else None)
+    try:
+        return ssl.create_default_context(cafile=opts.ca_file if opts else None)
+    except OSError as exc:
+        raise TransportConfigError(f"TLS configuration error: {exc}") from exc
+
+
+def _extra_headers(opts: ConnectOpts | None = None) -> dict[str, str] | None:
+    if not opts:
+        return None
+    extra_headers = dict(opts.headers)
+    if opts.origin:
+        extra_headers["Origin"] = opts.origin
+    return extra_headers or None
+
+
+async def open_connection(
+    uri: str,
+    timeout: float,
+    opts: ConnectOpts | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+) -> websockets.ClientConnection:
+    validate_ws_uri(uri)
+    validate_connect_opts(opts)
+    return await websockets.connect(
+        uri,
+        open_timeout=timeout,
+        close_timeout=timeout,
+        additional_headers=_extra_headers(opts),
+        ssl=make_ssl_context(uri, opts, ssl_context),
+    )
 
 
 async def send_payload(
@@ -129,22 +237,9 @@ async def send_payload(
     def _elapsed() -> float:
         return (time.monotonic() - start) * 1000
 
-    extra_headers = {}
-    if opts:
-        extra_headers.update(opts.headers)
-        if opts.origin:
-            extra_headers["Origin"] = opts.origin
-
     try:
-        ssl_context = make_ssl_context(uri, opts)
         async with asyncio.timeout(timeout):
-            async with websockets.connect(
-                uri,
-                open_timeout=timeout,
-                close_timeout=timeout,
-                additional_headers=extra_headers or None,
-                ssl=ssl_context,
-            ) as ws:
+            async with await open_connection(uri, timeout, opts) as ws:
                 if mode == "text":
                     await ws.send(payload.decode(errors="replace"))
                 else:
@@ -156,10 +251,10 @@ async def send_payload(
                         resp = resp.encode()
                     return TransportResult(response=resp, duration_ms=_elapsed())
                 except websockets.ConnectionClosed as e:
-                    return _handle_close(e, _elapsed())
+                    return handle_close(e, _elapsed())
 
     except websockets.ConnectionClosed as e:
-        return _handle_close(e, _elapsed())
+        return handle_close(e, _elapsed())
     except Exception as e:
         return classify_error(e, _elapsed())
 

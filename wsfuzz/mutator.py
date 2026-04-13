@@ -52,10 +52,10 @@ async def mutate_async(
             return stdout
     except TimeoutError:
         if proc is not None:
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, OSError):
                 proc.kill()
-            with contextlib.suppress(ProcessLookupError):
-                await proc.wait()
+            with contextlib.suppress(ProcessLookupError, OSError, TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=1)
     except (FileNotFoundError, OSError):
         pass
 

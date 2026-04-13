@@ -7,6 +7,7 @@ RSV bit abuse, fragmentation violations, payload length mismatches, etc.
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import os
 import random
@@ -20,7 +21,10 @@ from wsfuzz.transport import (
     ConnectOpts,
     TransportResult,
     classify_error,
+    is_http_token,
     make_ssl_context,
+    validate_connect_opts,
+    validate_ws_uri,
 )
 
 # Standard opcodes
@@ -89,6 +93,8 @@ def build_frame(
     )
 
     length = fake_length if fake_length is not None else len(payload)
+    if length < 0 or length > 2**64 - 1:
+        raise ValueError("frame length must be between 0 and 2^64-1")
     if length < 126:
         header = struct.pack("!BB", first, (0x80 if mask else 0) | length)
     elif length < 65536:
@@ -98,7 +104,9 @@ def build_frame(
 
     if mask:
         mask_key = os.urandom(4)
-        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        # Repeat mask key to payload length for efficient XOR
+        full_mask = mask_key * (len(payload) // 4 + 1)
+        masked = bytes(a ^ b for a, b in zip(payload, full_mask, strict=False))
         return header + mask_key + masked
     return header + payload
 
@@ -158,7 +166,7 @@ def _build_handshake(
     """Build the HTTP upgrade request for the WebSocket handshake."""
     lines = [
         f"GET {path} HTTP/1.1",
-        f"Host: {host}:{port}",
+        f"Host: {_format_host_header(host, port)}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",
@@ -178,17 +186,37 @@ def _build_handshake(
     return "\r\n".join(lines)
 
 
+def _format_host_header(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 def _request_target(parsed) -> str:
     path = parsed.path or "/"
+    if parsed.params:
+        path = f"{path};{parsed.params}"
     if parsed.query:
         return f"{path}?{parsed.query}"
     return path
 
 
-def _handshake_succeeded(response: bytes) -> bool:
+def _handshake_status_error(response: bytes) -> str | None:
     status_line = response.split(b"\r\n", 1)[0]
     parts = status_line.split(None, 2)
-    return len(parts) >= 2 and parts[1] == b"101"
+    if len(parts) < 2 or not _is_http_version(parts[0]):
+        return "malformed HTTP status line"
+    if parts[1] != b"101":
+        return "status is not 101"
+    return None
+
+
+def _is_http_version(value: bytes) -> bool:
+    prefix, separator, version = value.partition(b"/")
+    if prefix != b"HTTP" or separator != b"/":
+        return False
+    major, dot, minor = version.partition(b".")
+    return bool(major and dot == b"." and minor and major.isdigit() and minor.isdigit())
 
 
 def _expected_accept(key: str) -> str:
@@ -204,8 +232,13 @@ def _parse_handshake_headers(response: bytes) -> dict[str, str]:
         if not line or b":" not in line:
             continue
         key, value = line.split(b":", 1)
-        header_name = key.decode("ascii", errors="ignore").lower()
-        header_value = value.decode("ascii", errors="ignore").strip()
+        try:
+            header_name = key.decode("ascii").lower()
+            header_value = value.decode("ascii").strip()
+        except UnicodeDecodeError:
+            continue
+        if not is_http_token(header_name):
+            continue
         if header_name in headers:
             headers[header_name] = f"{headers[header_name]},{header_value}"
         else:
@@ -214,11 +247,17 @@ def _parse_handshake_headers(response: bytes) -> dict[str, str]:
 
 
 def _validate_handshake(response: bytes, key: str) -> str | None:
-    if not _handshake_succeeded(response):
-        return "status is not 101"
+    status_error = _handshake_status_error(response)
+    if status_error is not None:
+        return status_error
 
     headers = _parse_handshake_headers(response)
-    if headers.get("upgrade", "").lower() != "websocket":
+    upgrade_tokens = {
+        token.strip().lower()
+        for token in headers.get("upgrade", "").split(",")
+        if token.strip()
+    }
+    if "websocket" not in upgrade_tokens:
         return "missing Upgrade: websocket"
 
     connection_tokens = {
@@ -246,16 +285,19 @@ async def send_raw(
     ssl_context: ssl.SSLContext | None = None,
 ) -> TransportResult:
     """TCP connect, WS handshake, send raw frame, read response."""
-    parsed = urlparse(uri)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
-    path = _request_target(parsed)
     start = time.monotonic()
 
     def _elapsed() -> float:
         return (time.monotonic() - start) * 1000
 
     try:
+        validate_ws_uri(uri)
+        validate_connect_opts(opts)
+        parsed = urlparse(uri)
+        host = parsed.hostname
+        assert host is not None  # validated by validate_ws_uri
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        path = _request_target(parsed)
         tls_context = make_ssl_context(uri, opts, ssl_context)
         server_hostname = None
         if tls_context is not None:
@@ -287,6 +329,7 @@ async def send_raw(
                 handshake_error = _validate_handshake(response, key)
                 if handshake_error is not None:
                     return TransportResult(
+                        response=response,
                         error=(
                             f"handshake failed: {handshake_error}: "
                             f"{response[:80].decode(errors='replace')}"
@@ -313,7 +356,8 @@ async def send_raw(
                     return TransportResult(duration_ms=_elapsed())
             finally:
                 writer.close()
-                await writer.wait_closed()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
 
     except Exception as e:
         return classify_error(e, _elapsed())

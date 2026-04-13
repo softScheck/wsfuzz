@@ -25,18 +25,26 @@ Additional markers are supported for HTTP-driven templating:
 
 import asyncio
 import contextlib
+import json
 import re
 import signal
 from dataclasses import dataclass
+from functools import lru_cache
 from http import HTTPStatus
 from urllib.parse import parse_qs, urlsplit
 
-from wsfuzz.transport import ConnectOpts, send_payload
+from wsfuzz.transport import (
+    ConnectOpts,
+    contains_control_chars,
+    is_http_token,
+    send_payload,
+)
 
 _FUZZ_MARKER = "[FUZZ]"
 _TEMPLATE_MARKER_RE = re.compile(
     r"\[(FUZZ|METHOD|PATH|(HEADER|HEADERS|QUERY|QUERIES):([^\]]+))\]"
 )
+_MAX_HARNESS_BODY_BYTES = 10 * 1024 * 1024
 
 
 @dataclass
@@ -46,6 +54,14 @@ class HarnessRequest:
     query: dict[str, list[str]]
     headers: dict[str, list[str]]
     body: bytes
+
+
+class HarnessTemplateError(ValueError):
+    pass
+
+
+class HarnessBodyTooLargeError(ValueError):
+    pass
 
 
 def _build_response(
@@ -75,10 +91,15 @@ async def _send_response(
     *,
     headers: dict[str, str] | None = None,
 ) -> None:
-    writer.write(_build_response(status, body, headers=headers))
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+    try:
+        writer.write(_build_response(status, body, headers=headers))
+        await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        return
+    finally:
+        writer.close()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, OSError):
+            await writer.wait_closed()
 
 
 def _parse_headers(headers_raw: bytes) -> tuple[str, dict[str, list[str]]] | None:
@@ -98,13 +119,22 @@ def _parse_headers(headers_raw: bytes) -> tuple[str, dict[str, list[str]]] | Non
         if ":" not in line:
             return None
         key, value = line.split(":", 1)
-        headers.setdefault(key.strip().lower(), []).append(value.strip())
+        if key != key.strip():
+            return None
+        key = key.lower()
+        if not key or not is_http_token(key):
+            return None
+        value = value.strip()
+        if contains_control_chars(value):
+            return None
+        headers.setdefault(key, []).append(value)
 
     return lines[0], headers
 
 
 async def _read_chunked_body(reader: asyncio.StreamReader) -> bytes:
     chunks: list[bytes] = []
+    total_size = 0
     while True:
         line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=10)
         size_raw = line[:-2].split(b";", 1)[0]
@@ -117,6 +147,9 @@ async def _read_chunked_body(reader: asyncio.StreamReader) -> bytes:
                 trailer = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=10)
                 if trailer == b"\r\n":
                     return b"".join(chunks)
+        total_size += size
+        if total_size > _MAX_HARNESS_BODY_BYTES:
+            raise HarnessBodyTooLargeError("request body too large")
         chunks.append(await asyncio.wait_for(reader.readexactly(size), timeout=10))
         if await asyncio.wait_for(reader.readexactly(2), timeout=10) != b"\r\n":
             raise ValueError("invalid chunk terminator")
@@ -129,7 +162,11 @@ async def _read_request(
         headers_raw = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=10)
     except TimeoutError:
         return None, HTTPStatus.REQUEST_TIMEOUT
-    except (ConnectionResetError, asyncio.IncompleteReadError):
+    except (
+        ConnectionResetError,
+        asyncio.IncompleteReadError,
+        asyncio.LimitOverrunError,
+    ):
         return None, HTTPStatus.BAD_REQUEST
 
     parsed = _parse_headers(headers_raw[:-4])
@@ -138,27 +175,37 @@ async def _read_request(
     request_line, headers = parsed
 
     parts = request_line.split()
-    if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+    if len(parts) != 3 or not _is_http_version(parts[2]):
         return None, HTTPStatus.BAD_REQUEST
     method, target, _version = parts
     if method.upper() != "POST":
         return None, HTTPStatus.METHOD_NOT_ALLOWED
 
-    transfer_encoding = ",".join(headers.get("transfer-encoding", [])).lower()
+    transfer_encoding_tokens = [
+        token.strip().lower()
+        for value in headers.get("transfer-encoding", [])
+        for token in value.split(",")
+        if token.strip()
+    ]
     try:
-        if "chunked" in transfer_encoding:
+        if transfer_encoding_tokens == ["chunked"]:
             body = await _read_chunked_body(reader)
         else:
-            if transfer_encoding:
+            if transfer_encoding_tokens:
                 return None, HTTPStatus.NOT_IMPLEMENTED
             if "content-length" not in headers:
                 return None, HTTPStatus.LENGTH_REQUIRED
             try:
-                content_length = int(headers["content-length"][-1])
+                content_lengths = headers["content-length"]
+                if len(set(content_lengths)) != 1:
+                    return None, HTTPStatus.BAD_REQUEST
+                if not content_lengths[0].isdigit():
+                    return None, HTTPStatus.BAD_REQUEST
+                content_length = int(content_lengths[0])
             except ValueError:
                 return None, HTTPStatus.BAD_REQUEST
-            if content_length < 0:
-                return None, HTTPStatus.BAD_REQUEST
+            if content_length > _MAX_HARNESS_BODY_BYTES:
+                return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
             body = b""
             if content_length:
@@ -167,10 +214,15 @@ async def _read_request(
                 )
     except TimeoutError:
         return None, HTTPStatus.REQUEST_TIMEOUT
-    except (ValueError, asyncio.IncompleteReadError):
+    except HarnessBodyTooLargeError:
+        return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    except (ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
         return None, HTTPStatus.BAD_REQUEST
 
-    split = urlsplit(target)
+    try:
+        split = urlsplit(target)
+    except ValueError:
+        return None, HTTPStatus.BAD_REQUEST
     query = parse_qs(split.query, keep_blank_values=True)
     return (
         HarnessRequest(
@@ -184,26 +236,103 @@ async def _read_request(
     )
 
 
-def _apply_template(template: str, request: HarnessRequest) -> bytes:
+def _is_http_version(value: str) -> bool:
+    prefix, separator, version = value.partition("/")
+    if prefix != "HTTP" or separator != "/":
+        return False
+    major, dot, minor = version.partition(".")
+    return bool(major and dot == "." and minor and major.isdigit() and minor.isdigit())
+
+
+def _apply_template(
+    template: str,
+    request: HarnessRequest,
+    mode: str,
+    template_format: str = "raw",
+) -> bytes:
+    if template_format == "json":
+        return _apply_json_template(template, request, mode)
+    if template_format != "raw":
+        raise HarnessTemplateError("unsupported harness template format")
+    if mode == "binary" and template == _FUZZ_MARKER:
+        return request.body
+
     def replace_marker(match: re.Match[str]) -> str:
-        token = match.group(1)
-        kind = match.group(2)
-        key = match.group(3)
-        if token == "FUZZ":
-            return request.body.decode(errors="replace")
-        if token == "METHOD":
-            return request.method
-        if token == "PATH":
-            return request.path
-        if kind == "HEADER":
-            return request.headers.get(key.lower(), [""])[0]
-        if kind == "HEADERS":
-            return ",".join(request.headers.get(key.lower(), []))
-        if kind == "QUERY":
-            return request.query.get(key, [""])[0]
-        return ",".join(request.query.get(key, []))
+        return _marker_value(match, request, mode)
 
     return _TEMPLATE_MARKER_RE.sub(replace_marker, template).encode()
+
+
+def _apply_json_template(template: str, request: HarnessRequest, mode: str) -> bytes:
+    parsed = _parse_json_template(template)
+    rendered = _render_json_template_value(parsed, request, mode)
+    return json.dumps(rendered, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+@lru_cache(maxsize=128)
+def _parse_json_template(template: str):
+    try:
+        return json.loads(template)
+    except json.JSONDecodeError as exc:
+        raise HarnessTemplateError("JSON harness template is not valid JSON") from exc
+
+
+def _render_json_template_value(value, request: HarnessRequest, mode: str):
+    if isinstance(value, dict):
+        return {
+            _render_json_template_key(
+                str(key), request, mode
+            ): _render_json_template_value(
+                item,
+                request,
+                mode,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_render_json_template_value(item, request, mode) for item in value]
+    if not isinstance(value, str):
+        return value
+    full_match = _TEMPLATE_MARKER_RE.fullmatch(value)
+    if full_match:
+        return _marker_value(full_match, request, mode)
+    return _TEMPLATE_MARKER_RE.sub(
+        lambda match: _marker_value(match, request, mode),
+        value,
+    )
+
+
+def _render_json_template_key(key: str, request: HarnessRequest, mode: str) -> str:
+    return _TEMPLATE_MARKER_RE.sub(
+        lambda match: _marker_value(match, request, mode),
+        key,
+    )
+
+
+def _marker_value(match: re.Match[str], request: HarnessRequest, mode: str) -> str:
+    token = match.group(1)
+    kind = match.group(2)
+    key = match.group(3)
+    if token == "FUZZ":
+        if mode == "binary":
+            try:
+                return request.body.decode()
+            except UnicodeDecodeError as exc:
+                raise HarnessTemplateError(
+                    "binary [FUZZ] payload cannot be interpolated inside a text template"
+                ) from exc
+        return request.body.decode(errors="replace")
+    if token == "METHOD":
+        return request.method
+    if token == "PATH":
+        return request.path
+    if kind == "HEADER":
+        return request.headers.get(key.lower(), [""])[0]
+    if kind == "HEADERS":
+        return ",".join(request.headers.get(key.lower(), []))
+    if kind == "QUERY":
+        return request.query.get(key, [""])[0]
+    return ",".join(request.query.get(key, []))
 
 
 async def _handle_request(
@@ -215,6 +344,7 @@ async def _handle_request(
     timeout: float,
     opts: ConnectOpts | None,
     template: str | None,
+    template_format: str = "raw",
 ) -> None:
     """Handle one HTTP request: read body, send over WS, return response."""
     request, error_status = await _read_request(reader)
@@ -231,7 +361,15 @@ async def _handle_request(
         return
 
     assert request is not None
-    payload = _apply_template(template, request) if template else request.body
+    try:
+        payload = (
+            _apply_template(template, request, mode, template_format)
+            if template
+            else request.body
+        )
+    except HarnessTemplateError as exc:
+        await _send_response(writer, HTTPStatus.BAD_REQUEST, str(exc).encode())
+        return
 
     result = await send_payload(target, payload, mode, timeout, opts)
 
@@ -265,6 +403,7 @@ async def run_harness(
     timeout: float = 5.0,
     opts: ConnectOpts | None = None,
     template: str | None = None,
+    template_format: str = "raw",
     listen_host: str = "127.0.0.1",
     listen_port: int = 8765,
 ) -> None:
@@ -281,6 +420,7 @@ async def run_harness(
             timeout=timeout,
             opts=opts,
             template=template,
+            template_format=template_format,
         )
 
     server = await asyncio.start_server(handler, listen_host, listen_port)
@@ -292,6 +432,7 @@ async def run_harness(
     print(f"mode:       {mode}")
     if template:
         print(f"template:   {template}")
+        print(f"template-format: {template_format}")
     print()
     print("Point your HTTP tools at the listen address.")
     print("POST body → WebSocket message → HTTP response")

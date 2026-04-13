@@ -22,12 +22,15 @@ import base64
 import hashlib
 import struct
 
+import pytest
+
 from wsfuzz.raw import (
     OP_BINARY,
     OP_CLOSE,
     OP_CONTINUATION,
     OP_PING,
     OP_TEXT,
+    _build_handshake,
     _parse_close_frame,
     build_frame,
     send_raw,
@@ -86,6 +89,14 @@ class TestBuildFrame:
         frame = build_frame(b"", opcode=OP_PING, mask=True)
         assert frame[0] == 0x89  # FIN + PING
         assert frame[1] == 0x80  # MASK + len=0
+
+    @pytest.mark.parametrize("fake_length", [-1, 2**64])
+    def test_rejects_unencodable_fake_length(self, fake_length):
+        with pytest.raises(
+            ValueError,
+            match="frame length must be between 0 and 2\\^64-1",
+        ):
+            build_frame(b"x", opcode=OP_TEXT, fake_length=fake_length)
 
 
 class TestParseCloseFrame:
@@ -248,7 +259,7 @@ class TestProtocolViolations:
         assert result.error is None
         assert result.response is not None
 
-    def test_raw_handshake_preserves_query_string(self):
+    def test_raw_handshake_preserves_path_params_and_query_string(self):
         captured: dict[str, bytes] = {}
 
         def accept_from_request(request: bytes) -> bytes:
@@ -283,14 +294,27 @@ class TestProtocolViolations:
             async with server:
                 frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
                 result = await send_raw(
-                    f"ws://127.0.0.1:{port}/echo?token=abc&mode=test",
+                    f"ws://127.0.0.1:{port}/echo;v=1?token=abc&mode=test",
                     frame,
                     2.0,
                 )
                 assert isinstance(result, TransportResult)
 
         asyncio.run(run_test())
-        assert b"GET /echo?token=abc&mode=test HTTP/1.1" in captured["request"]
+        assert b"GET /echo;v=1?token=abc&mode=test HTTP/1.1" in captured["request"]
+
+    def test_raw_handshake_brackets_ipv6_host_header(self):
+        request = _build_handshake("::1", 8080, "/echo", "key")
+
+        assert "Host: [::1]:8080\r\n" in request
+
+    def test_send_raw_rejects_non_websocket_uri(self):
+        frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+
+        result = asyncio.run(send_raw("http://127.0.0.1:1/echo", frame, 1.0))
+
+        assert result.error_type == "ValueError"
+        assert result.error == "target must be a ws:// or wss:// URL"
 
     def test_raw_handshake_requires_status_101(self):
         async def handler(
@@ -314,6 +338,81 @@ class TestProtocolViolations:
 
         result = asyncio.run(run_test())
         assert result.error_type == "handshake_failed"
+        assert result.response is not None
+        assert result.response.startswith(b"HTTP/1.1 201")
+
+    def test_raw_handshake_rejects_non_http_status_line(self):
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            request = await reader.readuntil(b"\r\n\r\n")
+            key = None
+            for line in request.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+                    break
+            assert key is not None
+            digest = hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+            accept = base64.b64encode(digest)
+            writer.write(
+                b"NOTHTTP 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def run_test() -> TransportResult:
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+                return await send_raw(f"ws://127.0.0.1:{port}/echo", frame, 2.0)
+
+        result = asyncio.run(run_test())
+        assert result.error_type == "handshake_failed"
+        assert "malformed HTTP status line" in (result.error or "")
+
+    @pytest.mark.parametrize("status_prefix", [b"HTTP/banana", b"HTTP/1"])
+    def test_raw_handshake_rejects_malformed_http_version(self, status_prefix):
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            request = await reader.readuntil(b"\r\n\r\n")
+            key = None
+            for line in request.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+                    break
+            assert key is not None
+            digest = hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+            accept = base64.b64encode(digest)
+            writer.write(
+                status_prefix + b" 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def run_test() -> TransportResult:
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+                return await send_raw(f"ws://127.0.0.1:{port}/echo", frame, 2.0)
+
+        result = asyncio.run(run_test())
+        assert result.error_type == "handshake_failed"
+        assert "malformed HTTP status line" in (result.error or "")
 
     def test_raw_handshake_requires_upgrade_header(self):
         async def handler(
@@ -366,6 +465,78 @@ class TestProtocolViolations:
         assert result.error_type == "handshake_failed"
         assert "Sec-WebSocket-Accept" in (result.error or "")
 
+    def test_raw_handshake_rejects_malformed_required_header_name(self):
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            request = await reader.readuntil(b"\r\n\r\n")
+            key = None
+            for line in request.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+                    break
+            assert key is not None
+            digest = hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+            accept = base64.b64encode(digest)
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-\xffAccept: " + accept + b"\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def run_test() -> TransportResult:
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+                return await send_raw(f"ws://127.0.0.1:{port}/echo", frame, 2.0)
+
+        result = asyncio.run(run_test())
+        assert result.error_type == "handshake_failed"
+        assert "Sec-WebSocket-Accept" in (result.error or "")
+
+    def test_raw_handshake_rejects_malformed_required_header_value(self):
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            request = await reader.readuntil(b"\r\n\r\n")
+            key = None
+            for line in request.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+                    break
+            assert key is not None
+            digest = hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+            accept = base64.b64encode(digest)
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\xff\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def run_test() -> TransportResult:
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+                return await send_raw(f"ws://127.0.0.1:{port}/echo", frame, 2.0)
+
+        result = asyncio.run(run_test())
+        assert result.error_type == "handshake_failed"
+        assert "Sec-WebSocket-Accept" in (result.error or "")
+
     def test_raw_handshake_accepts_repeated_connection_headers(self):
         async def handler(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -402,6 +573,42 @@ class TestProtocolViolations:
         result = asyncio.run(run_test())
         assert result.error is None
 
+    def test_raw_handshake_accepts_repeated_upgrade_headers(self):
+        async def handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            request = await reader.readuntil(b"\r\n\r\n")
+            key = None
+            for line in request.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+                    break
+            assert key is not None
+            digest = hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+            accept = base64.b64encode(digest)
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: h2c\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Connection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async def run_test() -> TransportResult:
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            port = server.sockets[0].getsockname()[1]
+            async with server:
+                frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
+                return await send_raw(f"ws://127.0.0.1:{port}/echo", frame, 2.0)
+
+        result = asyncio.run(run_test())
+        assert result.error is None
+
     def test_raw_wss_with_missing_ca_is_classified(self, tls_echo_server):
         frame = build_frame(b"secure hello", opcode=OP_TEXT, mask=True)
         result = asyncio.run(
@@ -414,6 +621,7 @@ class TestProtocolViolations:
         )
         assert isinstance(result, TransportResult)
         assert result.error is not None
+        assert result.error_type == "transport_config"
 
 
 class TestRawFuzzerMode:

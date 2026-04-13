@@ -1,7 +1,17 @@
 import asyncio
 import os
+from typing import Any, cast
 
-from wsfuzz.transport import ConnectOpts, TransportResult, send_payload
+import pytest
+
+from wsfuzz.raw import build_frame, send_raw
+from wsfuzz.transport import (
+    ConnectOpts,
+    TransportResult,
+    make_connect_opts,
+    send_payload,
+    validate_ws_uri,
+)
 
 
 class TestTransportResult:
@@ -13,6 +23,82 @@ class TestTransportResult:
         assert r.close_code is None
         assert r.duration_ms == 0.0
         assert r.connection_refused is False
+
+
+class TestConnectOpts:
+    def test_rejects_header_newlines(self):
+        with pytest.raises(ValueError, match="headers must not contain newlines"):
+            make_connect_opts({"X-Test": "ok\r\nX-Evil: 1"})
+
+    def test_rejects_header_control_characters(self):
+        with pytest.raises(
+            ValueError,
+            match="headers must not contain control characters",
+        ):
+            make_connect_opts({"X-Test": "ok\x0bbad"})
+
+    def test_rejects_empty_header_name(self):
+        with pytest.raises(ValueError, match="header names must not be empty"):
+            make_connect_opts({" ": "value"})
+
+    def test_rejects_invalid_header_name(self):
+        with pytest.raises(ValueError, match="header names must be valid HTTP tokens"):
+            make_connect_opts({"Bad Header": "value"})
+
+    def test_rejects_header_name_surrounding_spaces(self):
+        with pytest.raises(ValueError, match="header names must be valid HTTP tokens"):
+            make_connect_opts({" X-Test": "value"})
+
+    def test_rejects_origin_newlines(self):
+        with pytest.raises(ValueError, match="origin must not contain newlines"):
+            make_connect_opts(origin="https://example.test\r\nX-Evil: 1")
+
+    def test_rejects_origin_control_characters(self):
+        with pytest.raises(
+            ValueError,
+            match="origin must not contain control characters",
+        ):
+            make_connect_opts(origin="https://example.test\x0bbad")
+
+    def test_rejects_non_string_headers(self):
+        headers = cast(dict[str, str], {"X-Test": cast(Any, 123)})
+        with pytest.raises(ValueError, match="headers must be strings"):
+            make_connect_opts(headers)
+
+
+class TestValidateWsUri:
+    @pytest.mark.parametrize(
+        ("uri", "message"),
+        [
+            ("ws://:123/socket", "target must include a host"),
+            (
+                "ws://example.test:bad/socket",
+                "target port must be between 1 and 65535",
+            ),
+            (
+                "ws://example.test:0/socket",
+                "target port must be between 1 and 65535",
+            ),
+            (
+                "ws://user:pass@example.test/socket",
+                "target must not contain userinfo",
+            ),
+        ],
+    )
+    def test_rejects_invalid_authority(self, uri, message):
+        with pytest.raises(ValueError, match=message):
+            validate_ws_uri(uri)
+
+    def test_rejects_fragments(self):
+        with pytest.raises(ValueError, match="target must not contain fragments"):
+            validate_ws_uri("ws://example.test/socket#client-state")
+
+    def test_rejects_control_characters(self):
+        with pytest.raises(
+            ValueError,
+            match="target must not contain control characters",
+        ):
+            validate_ws_uri("ws://example.test/socket\x0bcontrol")
 
 
 class TestSendPayload:
@@ -122,3 +208,29 @@ class TestSendPayload:
         )
         assert isinstance(result, TransportResult)
         assert result.error is not None
+        assert result.error_type == "transport_config"
+
+    def test_invalid_direct_connect_opts_are_config_error(self):
+        result = asyncio.run(
+            send_payload(
+                "ws://127.0.0.1:1",
+                b"test",
+                "binary",
+                1.0,
+                ConnectOpts(origin="https://example.test\r\nX-Evil: 1"),
+            )
+        )
+
+        assert result.error_type == "transport_config"
+
+    def test_invalid_direct_raw_connect_opts_are_config_error(self):
+        result = asyncio.run(
+            send_raw(
+                "ws://127.0.0.1:1",
+                build_frame(b"test"),
+                1.0,
+                ConnectOpts(headers={"X-Test": "ok\r\nX-Evil: 1"}),
+            )
+        )
+
+        assert result.error_type == "transport_config"

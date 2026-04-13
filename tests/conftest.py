@@ -1,16 +1,18 @@
 import asyncio
 import contextlib
+import json
 import ssl
 import subprocess
 import threading
 from collections.abc import Callable, Coroutine, Generator
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 import websockets
 
-from tests.echo_server import start_server
+from tests.echo_server import reset_server_state, start_server
 from tests.vulnerable_server import start_vulnerable_server
 
 type ServerStarter = Callable[[str, int], Coroutine[object, object, websockets.Server]]
@@ -67,6 +69,7 @@ def _make_server_fixture(starter: ServerStarter) -> Callable[..., Generator[str]
 
     @pytest.fixture
     def fixture() -> Generator[str]:
+        reset_server_state()
         loop = asyncio.new_event_loop()
         server = loop.run_until_complete(starter("127.0.0.1", 0))
         port = server.sockets[0].getsockname()[1]
@@ -122,3 +125,35 @@ def tls_echo_server(tmp_path_factory) -> Generator[TlsEchoServer]:
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=2)
     loop.close()
+
+
+@pytest.fixture
+def auth_http_server() -> Generator[str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            payload = json.loads(body.decode())
+            if payload != {"user": "test", "pass": "test"}:
+                self.send_response(403)
+                self.end_headers()
+                return
+            response = json.dumps({"token": "stage2"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)

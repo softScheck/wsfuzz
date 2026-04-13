@@ -97,6 +97,49 @@ class TestMutateAsync:
         assert proc.killed is True
         assert proc.waited is True
 
+    def test_async_timeout_does_not_hang_on_wait_timeout(self, monkeypatch):
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+
+            async def communicate(self, _seed_data: bytes):
+                return b"", b""
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                await asyncio.sleep(10)
+
+        proc = FakeProc()
+        calls = 0
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return proc
+
+        async def fake_wait_for(awaitable, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await awaitable
+            else:
+                awaitable.close()
+            raise TimeoutError
+
+        monkeypatch.setattr(
+            "wsfuzz.mutator.asyncio.create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        monkeypatch.setattr("wsfuzz.mutator.asyncio.wait_for", fake_wait_for)
+
+        result = asyncio.run(mutate_async(b"hello"))
+
+        assert isinstance(result, bytes)
+        assert len(result) == 5
+        assert proc.killed is True
+        assert calls == 2
+
     def test_async_concurrent_overlaps_work(self, monkeypatch):
         """Concurrent async mutations should overlap subprocess work."""
 
