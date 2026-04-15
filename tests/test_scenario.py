@@ -185,7 +185,7 @@ class TestScenarioRunner:
                     "pre_http": {},
                     "steps": [{"fuzz": "[FUZZ]"}],
                 },
-                "scenario pre_http requires url",
+                "scenario pre_http missing required key: url",
             ),
             (
                 {

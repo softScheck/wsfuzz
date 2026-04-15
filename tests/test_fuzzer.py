@@ -259,7 +259,7 @@ class TestFuzzerIntegration:
         )
         run(config)
         out = capsys.readouterr().out
-        assert "seeds:      1" in out
+        assert "seeds:       1" in out
         assert "iterations: 5" in out
 
     def test_fuzz_max_size_truncation(self, echo_server, tmp_path, capsys):

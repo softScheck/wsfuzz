@@ -1,8 +1,10 @@
 import asyncio
 import contextlib
 import json
+import logging
 import ssl
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Coroutine, Generator
 from dataclasses import dataclass
@@ -92,6 +94,54 @@ def _make_server_fixture(starter: ServerStarter) -> Callable[..., Generator[str]
 
 echo_server = _make_server_fixture(start_server)
 vuln_server = _make_server_fixture(start_vulnerable_server)
+
+
+class _CurrentStdoutStream:
+    """Proxy that forwards writes to whatever sys.stdout is at emit time.
+
+    Needed because logging.StreamHandler stores a stream reference at creation time,
+    but capsys replaces sys.stdout after fixture setup. Writing via this proxy
+    ensures log output lands in the capsys-captured buffer.
+    """
+
+    def write(self, data: str) -> int:
+        return sys.stdout.write(data)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _silence_websockets_logger() -> Generator[None]:
+    """Prevent websockets library logs from reaching pytest's root log handler.
+
+    The echo server runs in a background thread. After a test ends pytest
+    closes its captured stream, but connection teardown can still fire log
+    records through the websockets logger. Those records propagate to the
+    root logger, whose stream is already closed, causing spurious
+    '--- Logging error ---' output. Blocking propagation here suppresses it.
+    """
+    ws_logger = logging.getLogger("websockets")
+    ws_logger.addHandler(logging.NullHandler())
+    old_propagate = ws_logger.propagate
+    ws_logger.propagate = False
+    yield
+    ws_logger.propagate = old_propagate
+
+
+@pytest.fixture(autouse=True)
+def _route_wsfuzz_logs_to_stdout() -> Generator[None]:
+    """Route wsfuzz log output to stdout so capsys can capture it in tests."""
+    handler = logging.StreamHandler(_CurrentStdoutStream())  # type: ignore[arg-type]
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    loggers = [logging.getLogger("wsfuzz.fuzzer"), logging.getLogger("wsfuzz.harness")]
+    for logger in loggers:
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    yield
+    for logger in loggers:
+        logger.removeHandler(handler)
 
 
 @pytest.fixture

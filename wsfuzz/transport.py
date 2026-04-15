@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import re
 import ssl
 import time
@@ -109,7 +110,19 @@ def classify_error(e: Exception, elapsed_ms: float) -> TransportResult:
         )
     if isinstance(e, OSError):
         err_str = str(e)
-        is_refused = "Connect call failed" in err_str or "Connection refused" in err_str
+        is_refused = getattr(e, "errno", None) == errno.ECONNREFUSED
+
+        if not is_refused and hasattr(e, "exceptions"):
+            for ex in getattr(e, "exceptions", []):
+                if getattr(ex, "errno", None) == errno.ECONNREFUSED:
+                    is_refused = True
+                    break
+
+        if not is_refused:
+            is_refused = (
+                "Connect call failed" in err_str or "Connection refused" in err_str
+            )
+
         return TransportResult(
             error=err_str,
             error_type="connection_refused" if is_refused else "OSError",

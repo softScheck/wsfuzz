@@ -296,15 +296,77 @@ def _load_steps(raw_steps: Any, section: str) -> list[dict[str, Any]]:
     return steps
 
 
-def _validate_connect(connect: dict[str, Any]) -> None:
-    unsupported = set(connect) - {"url", "path", "headers", "origin"}
+def _validate_dict_schema(
+    data: dict[str, Any],
+    required_keys: set[str] | None = None,
+    optional_keys: set[str] | None = None,
+    key_types: dict[str, type | tuple[type, ...]] | None = None,
+    exactly_one: set[str] | None = None,
+    path: str = "",
+) -> None:
+    required_keys = required_keys or set()
+    optional_keys = optional_keys or set()
+    key_types = key_types or {}
+
+    if not isinstance(data, dict):
+        raise ScenarioError(f"{path} must be an object")
+
+    allowed_keys = required_keys | optional_keys
+    if exactly_one is not None:
+        allowed_keys |= exactly_one
+    unsupported = set(data) - allowed_keys
     if unsupported:
-        raise ScenarioError(f"unsupported scenario connect key: {min(unsupported)}")
+        raise ScenarioError(f"unsupported {path} key: {min(unsupported)}")
+
+    missing = required_keys - set(data)
+    if missing:
+        raise ScenarioError(f"{path} missing required key: {min(missing)}")
+
+    if exactly_one is not None:
+        present_from_exactly_one = set(data) & exactly_one
+        if len(present_from_exactly_one) != 1:
+            raise ScenarioError(
+                f"{path} must define exactly one of: {', '.join(sorted(exactly_one))}"
+            )
+
+    for key, expected_type in key_types.items():
+        if (
+            key in data
+            and data[key] is not None
+            and not isinstance(data[key], expected_type)
+        ):
+            type_names = (
+                "an object"
+                if expected_type is dict
+                else "an array"
+                if expected_type is list
+                else "a string"
+                if expected_type is str
+                else str(expected_type)
+            )
+            if isinstance(expected_type, tuple):
+                type_names = " or ".join(
+                    "an object"
+                    if t is dict
+                    else "an array"
+                    if t is list
+                    else "a string"
+                    if t is str
+                    else str(t)
+                    for t in expected_type
+                )
+            raise ScenarioError(f"{path}.{key} must be {type_names}")
+
+
+def _validate_connect(connect: dict[str, Any]) -> None:
+    _validate_dict_schema(
+        connect,
+        optional_keys={"url", "path", "headers", "origin"},
+        key_types={"url": str, "path": str, "origin": str, "headers": dict},
+        path="scenario connect",
+    )
     if "url" in connect and "path" in connect:
         raise ScenarioError("scenario connect cannot define both url and path")
-    for key in ("url", "path", "origin"):
-        if key in connect and not isinstance(connect[key], str):
-            raise ScenarioError(f"scenario connect.{key} must be a string")
     if "url" in connect and _VAR_RE.search(str(connect["url"])) is None:
         _validate_connect_url(str(connect["url"]))
     if "path" in connect:
@@ -324,21 +386,19 @@ def _validate_connect(connect: dict[str, Any]) -> None:
 
 
 def _validate_pre_http(pre_http: dict[str, Any]) -> None:
-    unsupported = set(pre_http) - {
-        "url",
-        "method",
-        "headers",
-        "body",
-        "expect_status",
-        "capture",
-    }
-    if unsupported:
-        raise ScenarioError(f"unsupported scenario pre_http key: {min(unsupported)}")
-    if "url" not in pre_http:
-        raise ScenarioError("scenario pre_http requires url")
-    for key in ("url", "method"):
-        if key in pre_http and not isinstance(pre_http[key], str):
-            raise ScenarioError(f"scenario pre_http.{key} must be a string")
+    _validate_dict_schema(
+        pre_http,
+        required_keys={"url"},
+        optional_keys={"method", "headers", "body", "expect_status", "capture"},
+        key_types={
+            "url": str,
+            "method": str,
+            "headers": dict,
+            "body": (dict, list, str, type(None)),
+            "capture": dict,
+        },
+        path="scenario pre_http",
+    )
     if "method" in pre_http and not is_http_token(str(pre_http["method"])):
         raise ScenarioError("scenario pre_http.method must be a valid HTTP token")
     pre_http_url_text = str(pre_http["url"])

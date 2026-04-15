@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import math
 import random
 import shutil
@@ -33,15 +34,20 @@ from wsfuzz.scenario import (
     select_fuzz_step,
 )
 from wsfuzz.transport import (
+    ConnectOpts,
     TransportResult,
     make_connect_opts,
     send_payload,
     validate_ws_uri,
 )
 
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class FuzzConfig:
+    """Holds configuration parameters governing fuzzing behavior and environment defaults."""
+
     target: str
     mode: str = "binary"
     seeds_dir: Path = Path("./seeds")
@@ -355,12 +361,68 @@ def _scenario_artifacts(
     return artifacts
 
 
+async def _replay_scenario_kind(
+    config: FuzzConfig,
+    metadata: dict[str, str],
+    path: Path,
+    payload: bytes,
+    opts: ConnectOpts | None,
+) -> TransportResult:
+    _, fuzz_ordinal = _load_scenario_metadata(metadata, path)
+    scenario_source = _resolve_replay_scenario_path(path, config.scenario, metadata)
+    if scenario_source is None:
+        raise ValueError("scenario replay metadata is missing scenario_path")
+    loaded_scenario = load_scenario(scenario_source)
+    scenario_mode = (
+        _load_mode_field(metadata, "scenario_mode")
+        or _load_mode_field(metadata, "message_mode")
+        or config.mode
+    )
+    fuzz_step = (
+        _scenario_fuzz_step_by_ordinal(loaded_scenario, fuzz_ordinal, path)
+        if fuzz_ordinal is not None
+        else select_fuzz_step(loaded_scenario, 0, config.scenario_fuzz_mode)
+    )
+    session_history = _load_scenario_session_history(path)
+    if session_history:
+        session = ScenarioSession(
+            loaded_scenario, config.target, scenario_mode, config.timeout, opts
+        )
+        try:
+            result = None
+            for prior_ordinal, prior_payload in session_history:
+                prior_step = _scenario_fuzz_step_by_ordinal(
+                    loaded_scenario,
+                    prior_ordinal,
+                    path.with_suffix(".scenario-session.json"),
+                )
+                result = await session.run(prior_payload, prior_step)
+                if result.error is not None or result.close_code is not None:
+                    break
+            else:
+                result = await session.run(payload, fuzz_step)
+        finally:
+            await session.close()
+        assert result is not None
+        return result
+    else:
+        return await run_scenario_iteration(
+            loaded_scenario,
+            config.target,
+            payload,
+            scenario_mode,
+            config.timeout,
+            opts,
+            fuzz_step,
+        )
+
+
 async def _replay(config: FuzzConfig) -> None:
     """Replay crash payloads from .bin files against the target."""
-    print("wsfuzz - Replay Mode")
-    print(f"target:  {config.target}")
-    print(f"files:   {len(config.replay)}")
-    print()
+    log.info("wsfuzz - Replay Mode")
+    log.info(f"target:  {config.target}")
+    log.info(f"files:   {len(config.replay)}")
+    log.info("")
 
     opts = make_connect_opts(
         config.headers,
@@ -395,64 +457,7 @@ async def _replay(config: FuzzConfig) -> None:
                 handshake_fuzz=handshake_fuzz,
             )
         elif replay_kind == "scenario":
-            _, fuzz_ordinal = _load_scenario_metadata(metadata, path)
-            scenario_source = _resolve_replay_scenario_path(
-                path,
-                config.scenario,
-                metadata,
-            )
-            if scenario_source is None:
-                raise ValueError("scenario replay metadata is missing scenario_path")
-            loaded_scenario = load_scenario(scenario_source)
-            scenario_mode = (
-                _load_mode_field(metadata, "scenario_mode")
-                or _load_mode_field(metadata, "message_mode")
-                or config.mode
-            )
-            fuzz_step = (
-                _scenario_fuzz_step_by_ordinal(
-                    loaded_scenario,
-                    fuzz_ordinal,
-                    path,
-                )
-                if fuzz_ordinal is not None
-                else select_fuzz_step(loaded_scenario, 0, config.scenario_fuzz_mode)
-            )
-            session_history = _load_scenario_session_history(path)
-            if session_history:
-                session = ScenarioSession(
-                    loaded_scenario,
-                    config.target,
-                    scenario_mode,
-                    config.timeout,
-                    opts,
-                )
-                try:
-                    result = None
-                    for prior_ordinal, prior_payload in session_history:
-                        prior_step = _scenario_fuzz_step_by_ordinal(
-                            loaded_scenario,
-                            prior_ordinal,
-                            path.with_suffix(".scenario-session.json"),
-                        )
-                        result = await session.run(prior_payload, prior_step)
-                        if result.error is not None or result.close_code is not None:
-                            break
-                    else:
-                        result = await session.run(payload, fuzz_step)
-                finally:
-                    await session.close()
-                assert result is not None
-            else:
-                result = await run_scenario_iteration(
-                    loaded_scenario,
-                    config.target,
-                    payload,
-                    scenario_mode,
-                    config.timeout,
-                    opts,
-                    fuzz_step,
-                )
+            result = await _replay_scenario_kind(config, metadata, path, payload, opts)
         else:
             replay_mode = _load_mode_field(metadata, "message_mode") or config.mode
             result = await send_payload(
@@ -462,17 +467,245 @@ async def _replay(config: FuzzConfig) -> None:
         status = f"ERROR {result.error_type}: {result.error}" if result.error else "ok"
         comparison = _compare_replay(metadata, result)
         replay_counts[comparison.status] += 1
-        print(
+        log.info(
             f"[{path.name}] {status} ({len(payload)}b, {result.duration_ms:.0f}ms) "
             f"replay: {comparison.status} ({comparison.detail})"
         )
     if config.replay:
-        print(
+        log.info(
             "replay summary: "
             f"{replay_counts['reproduced']} reproduced, "
             f"{replay_counts['changed']} changed, "
             f"{replay_counts['unchecked']} unchecked"
         )
+
+
+@dataclass
+class FuzzerState:
+    """Encapsulates fuzzer context and mutable session state to manage iterations cleanly."""
+
+    config: FuzzConfig
+    corpus: list[bytes]
+    logger: CrashLogger
+    opts: ConnectOpts | None
+    scenario: Scenario | None
+    scenario_session: ScenarioSession | None
+
+    length_mismatches: list[int]
+    raw_opcodes: list[int]
+
+    consecutive_refused: int = 0
+    stop: bool = False
+    scenario_session_history_seen: int = 0
+    scenario_session_history: list[tuple[int, bytes]] = field(default_factory=list)
+
+    async def _handle_connection_refused(self) -> None:
+        """Deals with connectivity dropouts, pacing retries or stopping entirely."""
+        if self.scenario_session is not None:
+            self.scenario_session_history.clear()
+            self.scenario_session_history_seen = 0
+
+        self.consecutive_refused += 1
+        log.warning(
+            f"[!] connection refused - is the server running at {self.config.target}?"
+        )
+        if (
+            self.config.max_retries > 0
+            and self.consecutive_refused >= self.config.max_retries
+        ):
+            log.warning(
+                f"[!] giving up after {self.consecutive_refused} consecutive failures"
+            )
+            self.stop = True
+        else:
+            await asyncio.sleep(1)
+
+    def _update_scenario_history(
+        self,
+        result: TransportResult,
+        selected_fuzz_step: FuzzStep | None,
+        payload: bytes,
+    ) -> None:
+        if self.scenario_session is not None and selected_fuzz_step is not None:
+            if result.error is None and result.close_code is None:
+                self.scenario_session_history_seen += 1
+                self.scenario_session_history.append(
+                    (selected_fuzz_step.ordinal, payload)
+                )
+                if (
+                    self.config.scenario_session_history_limit > 0
+                    and len(self.scenario_session_history)
+                    > self.config.scenario_session_history_limit
+                ):
+                    self.scenario_session_history[:] = self.scenario_session_history[
+                        -self.config.scenario_session_history_limit :
+                    ]
+            else:
+                self.scenario_session_history.clear()
+                self.scenario_session_history_seen = 0
+
+    async def _dispatch_raw(
+        self, payload: bytes
+    ) -> tuple[bytes, TransportResult, HandshakeFuzz | None]:
+        """Constructs hand-crafted WebSocket frames and bypasses standard libraries."""
+        fake_length = (
+            random.choice(self.length_mismatches) if random.random() < 0.05 else None
+        )
+        handshake_fuzz = make_handshake_fuzz(enabled=self.config.fuzz_handshake)
+        frame = build_frame(
+            payload,
+            opcode=random.choice(self.raw_opcodes),
+            fin=random.random() > 0.1,
+            mask=random.random() > 0.1,
+            rsv1=random.random() > 0.8,
+            rsv2=random.random() > 0.9,
+            rsv3=random.random() > 0.9,
+            fake_length=fake_length,
+        )
+        result = await send_raw(
+            self.config.target,
+            frame,
+            self.config.timeout,
+            self.opts,
+            handshake_fuzz=handshake_fuzz,
+        )
+        return frame, result, handshake_fuzz
+
+    async def _dispatch_scenario(
+        self, payload: bytes, selected_fuzz_step: FuzzStep
+    ) -> TransportResult:
+        """Executes a full stateful sequence and injects the payload at the designated step."""
+        if self.scenario_session is not None:
+            return await self.scenario_session.run(payload, selected_fuzz_step)
+
+        assert self.scenario is not None
+        return await run_scenario_iteration(
+            self.scenario,
+            self.config.target,
+            payload,
+            self.config.mode,
+            self.config.timeout,
+            self.opts,
+            selected_fuzz_step,
+        )
+
+    def _log_crash(
+        self,
+        iteration: int,
+        sent_payload: bytes,
+        payload: bytes,
+        result: TransportResult,
+        seed_index: int,
+        radamsa_seed: int,
+        handshake_fuzz: HandshakeFuzz | None,
+        selected_fuzz_step: FuzzStep | None,
+    ) -> None:
+        """Stores anomalies to disk with rich debugging metadata."""
+        if not self.logger.is_interesting(result):
+            log.debug(f"[{iteration}] ok ({len(payload)}b, {result.duration_ms:.0f}ms)")
+            return
+
+        prior_session_history = list(self.scenario_session_history)
+        prior_session_history_seen = self.scenario_session_history_seen
+        extra_metadata: dict[str, str] = {
+            "transport_mode": "raw"
+            if self.config.raw
+            else "scenario"
+            if self.scenario
+            else "normal",
+            "message_mode": self.config.mode,
+        }
+        if handshake_fuzz is not None:
+            extra_metadata.update(
+                handshake_fuzz="true",
+                handshake_version=handshake_fuzz.version,
+                handshake_extension=handshake_fuzz.extension or "",
+                handshake_protocol=handshake_fuzz.protocol or "",
+            )
+        if self.scenario is not None and selected_fuzz_step is not None:
+            extra_metadata.update(scenario_metadata(self.scenario, selected_fuzz_step))
+            extra_metadata["scenario_mode"] = self.config.mode
+            if self.scenario_session is not None:
+                extra_metadata["scenario_session_history_limit"] = str(
+                    self.config.scenario_session_history_limit
+                )
+                extra_metadata["scenario_session_history_saved"] = str(
+                    len(prior_session_history)
+                )
+                extra_metadata["scenario_session_history_truncated"] = (
+                    "true"
+                    if prior_session_history_seen > len(prior_session_history)
+                    else "false"
+                )
+
+        crash_log = self.logger.log_crash(
+            iteration,
+            sent_payload,
+            result,
+            seed_index,
+            radamsa_seed,
+            extra_metadata=extra_metadata,
+            extra_artifacts=_scenario_artifacts(
+                self.scenario, self.scenario_session, prior_session_history
+            ),
+        )
+        if crash_log.saved:
+            self.corpus.append(payload)
+            msg = f"[CRASH] #{iteration} {result.error_type}: {result.error}"
+            log.info(f"{msg} ({len(sent_payload)}b, {result.duration_ms:.0f}ms)")
+        else:
+            log.debug(
+                f"[DUP] #{iteration} {result.error_type}: {result.error} (seen {crash_log.duplicate_count}x)"
+            )
+
+    async def fuzz_one(self, iteration: int) -> None:
+        """Performs a single fuzzer iteration: pick seed, mutate, dispatch, and assess result."""
+        seed_index = random.randrange(len(self.corpus))
+        seed = self.corpus[seed_index]
+        radamsa_seed = random.randint(0, 2**32 - 1)
+
+        payload = await mutate_async(seed, self.config.radamsa_path, radamsa_seed)
+        if len(payload) > self.config.max_size:
+            payload = payload[: self.config.max_size]
+
+        sent_payload = payload
+        handshake_fuzz: HandshakeFuzz | None = None
+        selected_fuzz_step = (
+            select_fuzz_step(self.scenario, iteration, self.config.scenario_fuzz_mode)
+            if self.scenario is not None
+            else None
+        )
+
+        if self.config.raw:
+            sent_payload, result, handshake_fuzz = await self._dispatch_raw(payload)
+        elif self.scenario is not None:
+            assert selected_fuzz_step is not None
+            result = await self._dispatch_scenario(payload, selected_fuzz_step)
+        else:
+            result = await send_payload(
+                self.config.target,
+                payload,
+                self.config.mode,
+                self.config.timeout,
+                self.opts,
+            )
+
+        if result.connection_refused:
+            await self._handle_connection_refused()
+            return
+
+        self.consecutive_refused = 0
+        self._log_crash(
+            iteration,
+            sent_payload,
+            payload,
+            result,
+            seed_index,
+            radamsa_seed,
+            handshake_fuzz,
+            selected_fuzz_step,
+        )
+        self._update_scenario_history(result, selected_fuzz_step, payload)
 
 
 async def _fuzz_loop(config: FuzzConfig) -> None:
@@ -490,32 +723,30 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
         insecure=config.insecure,
     )
 
-    print("wsfuzz - WebSocket Fuzzer")
-    print(f"target:     {config.target}")
-    print(f"mode:       {'raw' if config.raw else config.mode}")
-    print(f"seeds:      {len(corpus)}")
-    print(f"max_size:   {config.max_size}")
-    print(f"concurrency: {config.concurrency}")
+    log.info("=========================================")
+    log.info("      wsfuzz - WebSocket Fuzzer          ")
+    log.info("=========================================")
+    log.info(f"{'target:':<13}{config.target}")
+    log.info(f"{'mode:':<13}{'raw' if config.raw else config.mode}")
+    log.info(f"{'seeds:':<13}{len(corpus)}")
+    log.info(f"{'max_size:':<13}{config.max_size}")
+    log.info(f"{'concurrency:':<13}{config.concurrency}")
     if scenario is not None:
-        print(f"scenario:   {scenario.path}")
-        print(f"scenario-fuzz: {config.scenario_fuzz_mode}")
+        log.info(f"{'scenario:':<13}{scenario.path}")
+        log.info(f"{'scenario-fuzz:':<13}{config.scenario_fuzz_mode}")
         if config.scenario_reuse_connection:
-            print("scenario-session: reused")
-    print(f"dedupe:     {'on' if config.crash_dedup else 'off'}")
+            log.info(f"{'scenario-session:':<13}reused")
+    log.info(f"{'dedupe:':<13}{'on' if config.crash_dedup else 'off'}")
     if config.fuzz_handshake:
-        print("handshake:  fuzz")
-    print(f"crashes:    {config.log_dir}")
+        log.info(f"{'handshake:':<13}fuzz")
+    log.info(f"{'crashes:':<13}{config.log_dir}")
     if not shutil.which(config.radamsa_path):
-        print(
+        log.warning(
             "[!] radamsa not found — using random mutation (install: https://gitlab.com/akihe/radamsa)"
         )
-    print()
+    log.info("")
 
     start_time = time.monotonic()
-    consecutive_refused = 0
-    stop = False
-    scenario_session_history: list[tuple[int, bytes]] = []
-    scenario_session_history_seen = 0
     scenario_session = (
         ScenarioSession(
             scenario,
@@ -531,176 +762,39 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
     # Payload length mismatch values for testing buffer pre-allocation bugs
     length_mismatches = [0, 1, 125, 126, 65535, 65536, 2**31 - 1]
     # Reserved + valid opcodes for raw-mode fuzzing
-    raw_opcode = OP_TEXT if config.mode == "text" else OP_BINARY
-    raw_opcodes = [raw_opcode, *range(3, 8), *range(0xB, 0x10)]
+    _base_opcode = OP_TEXT if config.mode == "text" else OP_BINARY
+    raw_opcodes = [_base_opcode, *range(3, 8), *range(0xB, 0x10)]
 
-    async def _fuzz_one(iteration: int) -> None:
-        nonlocal consecutive_refused, stop, scenario_session_history_seen
-        seed_index = random.randrange(len(corpus))
-        seed = corpus[seed_index]
-        radamsa_seed = random.randint(0, 2**32 - 1)
-
-        payload = await mutate_async(seed, config.radamsa_path, radamsa_seed)
-        if len(payload) > config.max_size:
-            payload = payload[: config.max_size]
-
-        sent_payload = payload
-        handshake_fuzz: HandshakeFuzz | None = None
-        selected_fuzz_step = (
-            select_fuzz_step(scenario, iteration, config.scenario_fuzz_mode)
-            if scenario is not None
-            else None
-        )
-        if config.raw:
-            # ~5% chance of payload length mismatch to test buffer pre-allocation
-            fake_length = (
-                random.choice(length_mismatches) if random.random() < 0.05 else None
-            )
-            handshake_fuzz = make_handshake_fuzz(enabled=config.fuzz_handshake)
-            frame = build_frame(
-                payload,
-                opcode=random.choice(raw_opcodes),
-                fin=random.random() > 0.1,
-                mask=random.random() > 0.1,
-                rsv1=random.random() > 0.8,
-                rsv2=random.random() > 0.9,
-                rsv3=random.random() > 0.9,
-                fake_length=fake_length,
-            )
-            # Persist the exact frame bytes so raw-mode crash files are replayable.
-            sent_payload = frame
-            result = await send_raw(
-                config.target,
-                frame,
-                config.timeout,
-                opts,
-                handshake_fuzz=handshake_fuzz,
-            )
-        elif scenario is not None:
-            assert selected_fuzz_step is not None
-            if scenario_session is not None:
-                result = await scenario_session.run(payload, selected_fuzz_step)
-            else:
-                result = await run_scenario_iteration(
-                    scenario,
-                    config.target,
-                    payload,
-                    config.mode,
-                    config.timeout,
-                    opts,
-                    selected_fuzz_step,
-                )
-        else:
-            result = await send_payload(
-                config.target, payload, config.mode, config.timeout, opts
-            )
-
-        if result.connection_refused:
-            if scenario_session is not None:
-                scenario_session_history.clear()
-                scenario_session_history_seen = 0
-            consecutive_refused += 1
-            print(f"[!] connection refused - is the server running at {config.target}?")
-            if config.max_retries > 0 and consecutive_refused >= config.max_retries:
-                print(f"[!] giving up after {consecutive_refused} consecutive failures")
-                stop = True
-            else:
-                await asyncio.sleep(1)
-            return
-
-        consecutive_refused = 0
-
-        if logger.is_interesting(result):
-            prior_session_history = list(scenario_session_history)
-            prior_session_history_seen = scenario_session_history_seen
-            extra_metadata: dict[str, str] = {
-                "transport_mode": "raw"
-                if config.raw
-                else "scenario"
-                if scenario
-                else "normal",
-                "message_mode": config.mode,
-            }
-            if handshake_fuzz is not None:
-                extra_metadata.update(
-                    handshake_fuzz="true",
-                    handshake_version=handshake_fuzz.version,
-                    handshake_extension=handshake_fuzz.extension or "",
-                    handshake_protocol=handshake_fuzz.protocol or "",
-                )
-            if scenario is not None and selected_fuzz_step is not None:
-                extra_metadata.update(scenario_metadata(scenario, selected_fuzz_step))
-                extra_metadata["scenario_mode"] = config.mode
-                if scenario_session is not None:
-                    extra_metadata["scenario_session_history_limit"] = str(
-                        config.scenario_session_history_limit
-                    )
-                    extra_metadata["scenario_session_history_saved"] = str(
-                        len(prior_session_history)
-                    )
-                    extra_metadata["scenario_session_history_truncated"] = (
-                        "true"
-                        if prior_session_history_seen > len(prior_session_history)
-                        else "false"
-                    )
-            crash_log = logger.log_crash(
-                iteration,
-                sent_payload,
-                result,
-                seed_index,
-                radamsa_seed,
-                extra_metadata=extra_metadata,
-                extra_artifacts=_scenario_artifacts(
-                    scenario, scenario_session, prior_session_history
-                ),
-            )
-            if crash_log.saved:
-                corpus.append(payload)
-                msg = f"[CRASH] #{iteration} {result.error_type}: {result.error}"
-                print(f"{msg} ({len(sent_payload)}b, {result.duration_ms:.0f}ms)")
-            elif config.verbose:
-                print(
-                    f"[DUP] #{iteration} {result.error_type}: {result.error} "
-                    f"(seen {crash_log.duplicate_count}x)"
-                )
-        elif config.verbose:
-            print(f"[{iteration}] ok ({len(payload)}b, {result.duration_ms:.0f}ms)")
-
-        if scenario_session is not None and selected_fuzz_step is not None:
-            if result.error is None and result.close_code is None:
-                scenario_session_history_seen += 1
-                scenario_session_history.append((selected_fuzz_step.ordinal, payload))
-                if (
-                    config.scenario_session_history_limit > 0
-                    and len(scenario_session_history)
-                    > config.scenario_session_history_limit
-                ):
-                    scenario_session_history[:] = scenario_session_history[
-                        -config.scenario_session_history_limit :
-                    ]
-            else:
-                scenario_session_history.clear()
-                scenario_session_history_seen = 0
+    state = FuzzerState(
+        config=config,
+        corpus=corpus,
+        logger=logger,
+        opts=opts,
+        scenario=scenario,
+        scenario_session=scenario_session,
+        length_mismatches=length_mismatches,
+        raw_opcodes=raw_opcodes,
+    )
 
     def _print_progress(iteration: int) -> None:
         elapsed = time.monotonic() - start_time
         rate = iteration / elapsed if elapsed > 0 else 0
-        print(
+        log.info(
             f"[{iteration}] running... ({logger.crash_count} crashes, {rate:.1f} req/s)"
         )
 
     iteration = 0
     try:
         if config.concurrency <= 1:
-            while not stop and (
+            while not state.stop and (
                 config.iterations == 0 or iteration < config.iterations
             ):
-                await _fuzz_one(iteration)
+                await state.fuzz_one(iteration)
                 iteration += 1
                 if iteration % 100 == 0:
                     _print_progress(iteration)
         else:
-            while not stop and (
+            while not state.stop and (
                 config.iterations == 0 or iteration < config.iterations
             ):
                 remaining = (
@@ -709,7 +803,9 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
                     else config.concurrency
                 )
                 batch = min(config.concurrency, remaining)
-                await asyncio.gather(*[_fuzz_one(iteration + j) for j in range(batch)])
+                await asyncio.gather(
+                    *[state.fuzz_one(iteration + j) for j in range(batch)]
+                )
                 iteration += batch
                 if iteration % 100 < batch:
                     _print_progress(iteration)
@@ -721,5 +817,5 @@ async def _fuzz_loop(config: FuzzConfig) -> None:
 
     elapsed = time.monotonic() - start_time
     rate = iteration / elapsed if elapsed > 0 else 0
-    print(logger.summary(iteration))
-    print(f"rate: {rate:.1f} req/s")
+    log.info(logger.summary(iteration))
+    log.info(f"rate: {rate:.1f} req/s")

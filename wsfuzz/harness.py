@@ -26,6 +26,7 @@ Additional markers are supported for HTTP-driven templating:
 import asyncio
 import contextlib
 import json
+import logging
 import re
 import signal
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ from wsfuzz.transport import (
     is_http_token,
     send_payload,
 )
+
+logger = logging.getLogger(__name__)
 
 _FUZZ_MARKER = "[FUZZ]"
 _TEMPLATE_MARKER_RE = re.compile(
@@ -195,15 +198,10 @@ async def _read_request(
                 return None, HTTPStatus.NOT_IMPLEMENTED
             if "content-length" not in headers:
                 return None, HTTPStatus.LENGTH_REQUIRED
-            try:
-                content_lengths = headers["content-length"]
-                if len(set(content_lengths)) != 1:
-                    return None, HTTPStatus.BAD_REQUEST
-                if not content_lengths[0].isdigit():
-                    return None, HTTPStatus.BAD_REQUEST
-                content_length = int(content_lengths[0])
-            except ValueError:
+            content_lengths = headers["content-length"]
+            if len(set(content_lengths)) != 1 or not content_lengths[0].isdigit():
                 return None, HTTPStatus.BAD_REQUEST
+            content_length = int(content_lengths[0])
             if content_length > _MAX_HARNESS_BODY_BYTES:
                 return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
@@ -426,17 +424,17 @@ async def run_harness(
     server = await asyncio.start_server(handler, listen_host, listen_port)
     addr = server.sockets[0].getsockname()
 
-    print("wsfuzz - HTTP-to-WebSocket Harness")
-    print(f"listening:  http://{addr[0]}:{addr[1]}")
-    print(f"target:     {target}")
-    print(f"mode:       {mode}")
+    logger.info("wsfuzz - HTTP-to-WebSocket Harness")
+    logger.info(f"listening:  http://{addr[0]}:{addr[1]}")
+    logger.info(f"target:     {target}")
+    logger.info(f"mode:       {mode}")
     if template:
-        print(f"template:   {template}")
-        print(f"template-format: {template_format}")
-    print()
-    print("Point your HTTP tools at the listen address.")
-    print("POST body → WebSocket message → HTTP response")
-    print()
+        logger.info(f"template:   {template}")
+        logger.info(f"template-format: {template_format}")
+    logger.info("")
+    logger.info("Point your HTTP tools at the listen address.")
+    logger.info("POST body → WebSocket message → HTTP response")
+    logger.info("")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -447,4 +445,4 @@ async def run_harness(
     async with server:
         await stop.wait()
 
-    print("\nharness stopped")
+    logger.info("harness stopped")

@@ -96,7 +96,8 @@ wsfuzz -t ws://localhost:64999/api --harness --harness-template '{"user":"[FUZZ]
 | `--scenario-reuse-connection` | Reuse one WS connection across scenario iterations | off |
 | `--scenario-session-history-limit` | Max prior reused-session fuzz messages saved for replay | `100` |
 | `--radamsa` | Path to radamsa binary | `radamsa` |
-| `-v, --verbose` | Verbose output | off |
+| `-v, --verbose` | Verbose debug output | off |
+| `-q, --quiet` | Quiet output (warnings/errors only) | off |
 | `--no-dedupe` | Save every interesting crash instead of deduplicating by behavior | off |
 | `--harness` | Run the HTTP-to-WebSocket bridge for HTTP security tools | off |
 | `--harness-port` | Harness listen port | `8765` |

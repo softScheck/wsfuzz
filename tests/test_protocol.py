@@ -640,7 +640,7 @@ class TestRawFuzzerMode:
         )
         run(config)
         out = capsys.readouterr().out
-        assert "mode:       raw" in out
+        assert "mode:        raw" in out
         assert "iterations: 20" in out
 
     def test_raw_mode_detects_protocol_errors(self, echo_server, tmp_path, capsys):
@@ -676,7 +676,7 @@ class TestRawFuzzerMode:
         )
         run(config)
         out = capsys.readouterr().out
-        assert "handshake:  fuzz" in out
+        assert "handshake:   fuzz" in out
 
 
 class TestPayloadLengthMismatch:

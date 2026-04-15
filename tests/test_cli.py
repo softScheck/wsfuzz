@@ -183,7 +183,7 @@ class TestCli:
         result = _run_cli(
             "-t", "ws://127.0.0.1:1", "--scenario", str(scenario_path), "-n", "1"
         )
-        assert "mode:       text" in result.stdout
+        assert "mode:        text" in result.stdout
 
     def test_binary_structured_scenario_requires_text_mode(self, tmp_path):
         scenario_path = tmp_path / "scenario.json"

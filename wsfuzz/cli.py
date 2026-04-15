@@ -1,5 +1,7 @@
 import argparse
+import logging
 import math
+import sys
 from pathlib import Path
 
 from wsfuzz.fuzzer import FuzzConfig, run
@@ -11,6 +13,81 @@ from wsfuzz.transport import (
     make_connect_opts,
     validate_ws_uri,
 )
+
+
+def validate_args(args, parser) -> None:
+    try:
+        validate_ws_uri(args.target)
+    except ValueError as exc:
+        parser.error(str(exc))
+    _validate_mode_combinations(args, parser)
+    _validate_harness_options(args, parser)
+    _validate_scenario_options(args, parser)
+    _validate_numeric_bounds(args, parser)
+    _validate_port_and_concurrency(args, parser)
+    _validate_origin(args, parser)
+
+
+def _validate_mode_combinations(args, parser) -> None:
+    if args.fuzz_handshake and not args.raw:
+        parser.error("--fuzz-handshake requires --raw")
+    if args.scenario and args.raw:
+        parser.error("--scenario is not supported with --raw")
+    if args.scenario and args.harness:
+        parser.error("--scenario is not supported with --harness")
+    if args.harness and args.raw:
+        parser.error("--raw is not supported with --harness")
+    if args.harness and args.replay:
+        parser.error("--replay is not supported with --harness")
+
+
+def _validate_harness_options(args, parser) -> None:
+    if not args.harness and args.harness_template:
+        parser.error("--harness-template requires --harness")
+    if not args.harness and args.harness_template_format != "raw":
+        parser.error("--harness-template-format requires --harness")
+    if not args.harness and args.harness_port != 8765:
+        parser.error("--harness-port requires --harness")
+    if (
+        args.harness
+        and args.harness_template_format != "raw"
+        and not args.harness_template
+    ):
+        parser.error("--harness-template-format requires --harness-template")
+
+
+def _validate_scenario_options(args, parser) -> None:
+    if args.scenario_reuse_connection and not args.scenario:
+        parser.error("--scenario-reuse-connection requires --scenario")
+
+
+def _validate_numeric_bounds(args, parser) -> None:
+    if args.iterations < 0:
+        parser.error("--iterations must be non-negative")
+    if args.max_size <= 0:
+        parser.error("--max-size must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be positive")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be positive")
+    if args.max_retries < 0:
+        parser.error("--max-retries must be non-negative")
+    if args.scenario_session_history_limit < 0:
+        parser.error("--scenario-session-history-limit must be non-negative")
+
+
+def _validate_port_and_concurrency(args, parser) -> None:
+    if not 1 <= args.harness_port <= 65535:
+        parser.error("--harness-port must be between 1 and 65535")
+    if args.scenario_reuse_connection and args.concurrency > 1:
+        parser.error("--scenario-reuse-connection requires concurrency 1")
+
+
+def _validate_origin(args, parser) -> None:
+    if args.origin and any(char in args.origin for char in "\r\n"):
+        parser.error("--origin must not contain newlines")
+    if args.origin and contains_control_chars(args.origin):
+        parser.error("--origin must not contain control characters")
 
 
 def main() -> None:
@@ -105,6 +182,7 @@ def main() -> None:
         help="stop after N consecutive connection refused errors (0 = never stop, default: 5)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose output")
+    parser.add_argument("-q", "--quiet", action="store_true", help="quiet output")
     parser.add_argument(
         "--no-dedupe",
         action="store_true",
@@ -134,66 +212,20 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    try:
-        validate_ws_uri(args.target)
-    except ValueError as exc:
-        parser.error(str(exc))
-    if args.fuzz_handshake and not args.raw:
-        parser.error("--fuzz-handshake requires --raw")
-    if args.scenario and args.raw:
-        parser.error("--scenario is not supported with --raw")
-    if args.scenario and args.harness:
-        parser.error("--scenario is not supported with --harness")
-    if args.harness and args.raw:
-        parser.error("--raw is not supported with --harness")
-    if args.harness and args.replay:
-        parser.error("--replay is not supported with --harness")
-    if not args.harness and args.harness_template:
-        parser.error("--harness-template requires --harness")
-    if not args.harness and args.harness_template_format != "raw":
-        parser.error("--harness-template-format requires --harness")
-    if not args.harness and args.harness_port != 8765:
-        parser.error("--harness-port requires --harness")
-    if (
-        args.harness
-        and args.harness_template_format != "raw"
-        and not args.harness_template
-    ):
-        parser.error("--harness-template-format requires --harness-template")
-    if args.scenario_reuse_connection and not args.scenario:
-        parser.error("--scenario-reuse-connection requires --scenario")
-    if args.iterations < 0:
-        parser.error("--iterations must be non-negative")
-    if args.max_size <= 0:
-        parser.error("--max-size must be positive")
-    if not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("--timeout must be positive")
-    if args.concurrency < 1:
-        parser.error("--concurrency must be positive")
-    if args.max_retries < 0:
-        parser.error("--max-retries must be non-negative")
-    if args.scenario_session_history_limit < 0:
-        parser.error("--scenario-session-history-limit must be non-negative")
-    if not 1 <= args.harness_port <= 65535:
-        parser.error("--harness-port must be between 1 and 65535")
-    if args.scenario_reuse_connection and args.concurrency > 1:
-        parser.error("--scenario-reuse-connection requires concurrency 1")
-    if args.origin and any(char in args.origin for char in "\r\n"):
-        parser.error("--origin must not contain newlines")
-    if args.origin and contains_control_chars(args.origin):
-        parser.error("--origin must not contain control characters")
+    validate_args(args, parser)
 
-    selected_mode = args.mode or ("text" if args.scenario else "binary")
-    if args.scenario and args.mode == "binary":
-        try:
-            scenario = load_scenario(Path(args.scenario))
-        except ScenarioError as exc:
-            parser.error(str(exc))
-        if scenario_requires_text_mode(scenario):
-            parser.error(
-                "binary scenario mode only supports raw [FUZZ] messages or binary-safe setup steps; "
-                "use -m text for structured JSON/text scenarios"
-            )
+    log_level = logging.INFO
+    if args.quiet:
+        log_level = logging.WARNING
+    elif args.verbose:
+        log_level = logging.DEBUG
+
+    logging.basicConfig(
+        level=log_level, format="%(message)s", stream=sys.stdout, force=True
+    )
+    if args.verbose:
+        for name in ("wsfuzz", "wsfuzz.fuzzer", "wsfuzz.harness"):
+            logging.getLogger(name).setLevel(logging.DEBUG)
 
     replay_files: list[Path] = []
     if args.replay:
@@ -207,6 +239,18 @@ def main() -> None:
                 replay_files.extend(sorted(p.glob("crash_*.bin")))
         if not replay_files:
             parser.error("--replay did not match any crash .bin files")
+
+    selected_mode = args.mode or ("text" if args.scenario else "binary")
+    if args.scenario and args.mode == "binary":
+        try:
+            scenario = load_scenario(Path(args.scenario))
+        except ScenarioError as exc:
+            parser.error(str(exc))
+        if scenario_requires_text_mode(scenario):
+            parser.error(
+                "binary scenario mode only supports raw [FUZZ] messages or binary-safe setup steps; "
+                "use -m text for structured JSON/text scenarios"
+            )
 
     headers: dict[str, str] = {}
     if args.header:
@@ -275,7 +319,7 @@ def main() -> None:
         except ValueError as exc:
             parser.error(str(exc))
         except KeyboardInterrupt:
-            print("\ninterrupted")
+            logging.info("interrupted")
         return
 
     try:
@@ -283,4 +327,4 @@ def main() -> None:
     except (ScenarioError, ValueError) as exc:
         parser.error(str(exc))
     except KeyboardInterrupt:
-        print("\ninterrupted")
+        logging.info("interrupted")
