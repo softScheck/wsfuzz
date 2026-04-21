@@ -514,7 +514,8 @@ class TestHarnessErrors:
                 body = resp.read()
                 assert resp.status == 502
                 assert b"WS_ERROR" in body
-                assert resp.getheader("X-WS-Error-Type") is not None
+                assert resp.getheader("X-WS-Error-Type") == "close_1011"
+                assert resp.getheader("X-WS-Close-Code") == "1011"
 
         loop.run_until_complete(_run())
         loop.close()
@@ -541,7 +542,8 @@ class TestHarnessErrors:
                 resp = await loop.run_in_executor(None, _http_post, port, b"test")
                 body = resp.read()
                 assert resp.status == 502
-                assert b"connection_refused" in body or b"refused" in body.lower()
+                assert resp.getheader("X-WS-Error-Type") == "connection_refused"
+                assert b"connection_refused" in body
 
         loop.run_until_complete(_run())
         loop.close()

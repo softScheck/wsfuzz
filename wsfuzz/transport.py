@@ -60,6 +60,14 @@ def is_http_token(value: str) -> bool:
     return _HTTP_TOKEN_RE.fullmatch(value) is not None
 
 
+def is_http_version(value: str) -> bool:
+    prefix, separator, version = value.partition("/")
+    if prefix != "HTTP" or separator != "/":
+        return False
+    major, dot, minor = version.partition(".")
+    return bool(major and dot == "." and minor and major.isdigit() and minor.isdigit())
+
+
 def contains_control_chars(value: str) -> bool:
     return any(char in _CONTROL_CHARS for char in value)
 
@@ -75,6 +83,15 @@ def handle_close(e: websockets.ConnectionClosed, elapsed_ms: float) -> Transport
             duration_ms=elapsed_ms,
         )
     return TransportResult(close_code=code, duration_ms=elapsed_ms)
+
+
+def _is_oserror_refused(e: OSError, err_str: str) -> bool:
+    if getattr(e, "errno", None) == errno.ECONNREFUSED:
+        return True
+    for ex in getattr(e, "exceptions", ()):
+        if getattr(ex, "errno", None) == errno.ECONNREFUSED:
+            return True
+    return "Connect call failed" in err_str or "Connection refused" in err_str
 
 
 def classify_error(e: Exception, elapsed_ms: float) -> TransportResult:
@@ -110,19 +127,7 @@ def classify_error(e: Exception, elapsed_ms: float) -> TransportResult:
         )
     if isinstance(e, OSError):
         err_str = str(e)
-        is_refused = getattr(e, "errno", None) == errno.ECONNREFUSED
-
-        if not is_refused and hasattr(e, "exceptions"):
-            for ex in getattr(e, "exceptions", []):
-                if getattr(ex, "errno", None) == errno.ECONNREFUSED:
-                    is_refused = True
-                    break
-
-        if not is_refused:
-            is_refused = (
-                "Connect call failed" in err_str or "Connection refused" in err_str
-            )
-
+        is_refused = _is_oserror_refused(e, err_str)
         return TransportResult(
             error=err_str,
             error_type="connection_refused" if is_refused else "OSError",
@@ -183,12 +188,19 @@ def _validate_connect_headers(headers: dict[str, str]) -> None:
             raise TransportConfigError("headers must be strings")
         if not key.strip():
             raise TransportConfigError("header names must not be empty")
-        if not is_http_token(key) or key != key.strip():
+        if not is_http_token(key):
             raise TransportConfigError("header names must be valid HTTP tokens")
         if any(char in value for char in "\r\n"):
             raise TransportConfigError("headers must not contain newlines")
         if contains_control_chars(value):
             raise TransportConfigError("headers must not contain control characters")
+
+
+def make_insecure_ssl_context() -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 def make_ssl_context(
@@ -205,7 +217,7 @@ def make_ssl_context(
     if override is not None:
         return override
     if opts and opts.insecure:
-        return ssl._create_unverified_context()
+        return make_insecure_ssl_context()
     try:
         return ssl.create_default_context(cafile=opts.ca_file if opts else None)
     except OSError as exc:

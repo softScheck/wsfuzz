@@ -301,7 +301,8 @@ class TestNormalOperationParity:
         r = asyncio.run(send_raw(echo_server + "/echo", frame, 5.0))
         assert r.error is None
         assert r.connection_refused is False
-        assert r.response is not None
+        # Raw mode returns full frame bytes — payload embedded after header
+        assert b"hello" in r.response
 
 
 class TestCustomHeadersParity:

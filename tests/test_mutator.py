@@ -5,7 +5,7 @@ from wsfuzz.mutator import load_seeds, mutate, mutate_async
 
 
 class TestMutate:
-    def test_mutate_returns_bytes(self):
+    def test_mutate_returns_nonempty_bytes(self):
         result = mutate(b"hello world")
         assert isinstance(result, bytes)
         assert len(result) > 0
@@ -23,14 +23,23 @@ class TestMutate:
         results = {mutate(seed_data, seed_num=i) for i in range(10)}
         assert len(results) > 1
 
-    def test_mutate_fallback_on_bad_binary(self):
-        result = mutate(b"hello", radamsa_path="/nonexistent/radamsa")
-        assert isinstance(result, bytes)
-        assert len(result) == 5
+    def test_mutate_actually_mutates(self):
+        """Radamsa should produce output different from the input at least sometimes."""
+        seed_data = b"the quick brown fox jumps over the lazy dog"
+        results = {mutate(seed_data, seed_num=i) for i in range(20)}
+        # At least one mutation should differ from original
+        assert seed_data not in results or len(results) > 1
 
-    def test_mutate_empty_input_fallback(self):
+    def test_fallback_returns_random_bytes_of_seed_length(self):
+        result = mutate(b"hello", radamsa_path="/nonexistent/radamsa")
+        assert len(result) == 5
+        # Fallback uses os.urandom — vanishingly unlikely to equal input
+        # Run multiple times to verify randomness
+        result2 = mutate(b"hello", radamsa_path="/nonexistent/radamsa")
+        assert result != result2  # urandom should differ
+
+    def test_fallback_empty_input_uses_default_size(self):
         result = mutate(b"", radamsa_path="/nonexistent/radamsa")
-        assert isinstance(result, bytes)
         assert len(result) == 200
 
 

@@ -22,6 +22,7 @@ from wsfuzz.transport import (
     TransportResult,
     classify_error,
     is_http_token,
+    is_http_version,
     make_ssl_context,
     validate_connect_opts,
     validate_ws_uri,
@@ -111,7 +112,7 @@ def build_frame(
     return header + payload
 
 
-def _parse_close_frame(data: bytes) -> TransportResult | None:
+def _parse_close_frame(data: bytes, elapsed_ms: float = 0.0) -> TransportResult | None:
     """Try to parse a WebSocket close frame from raw response bytes.
 
     Returns a TransportResult with close_code/error if the response is a close
@@ -150,6 +151,7 @@ def _parse_close_frame(data: bytes) -> TransportResult | None:
             error=f"close code {code}",
             error_type=f"close_{code}",
             close_code=code,
+            duration_ms=elapsed_ms,
         )
     return None
 
@@ -194,8 +196,6 @@ def _format_host_header(host: str, port: int) -> str:
 
 def _request_target(parsed) -> str:
     path = parsed.path or "/"
-    if parsed.params:
-        path = f"{path};{parsed.params}"
     if parsed.query:
         return f"{path}?{parsed.query}"
     return path
@@ -212,11 +212,10 @@ def _handshake_status_error(response: bytes) -> str | None:
 
 
 def _is_http_version(value: bytes) -> bool:
-    prefix, separator, version = value.partition(b"/")
-    if prefix != b"HTTP" or separator != b"/":
+    try:
+        return is_http_version(value.decode("ascii"))
+    except UnicodeDecodeError:
         return False
-    major, dot, minor = version.partition(b".")
-    return bool(major and dot == b"." and minor and major.isdigit() and minor.isdigit())
 
 
 def _expected_accept(key: str) -> str:
@@ -346,9 +345,8 @@ async def send_raw(
                         reader.read(4096), timeout=min(timeout, 2.0)
                     )
                     if data:
-                        close = _parse_close_frame(data)
+                        close = _parse_close_frame(data, _elapsed())
                         if close:
-                            close.duration_ms = _elapsed()
                             return close
                         return TransportResult(response=data, duration_ms=_elapsed())
                     return TransportResult(duration_ms=_elapsed())

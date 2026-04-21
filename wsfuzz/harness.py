@@ -38,6 +38,7 @@ from wsfuzz.transport import (
     ConnectOpts,
     contains_control_chars,
     is_http_token,
+    is_http_version,
     send_payload,
 )
 
@@ -145,6 +146,8 @@ async def _read_chunked_body(reader: asyncio.StreamReader) -> bytes:
             size = int(size_raw.decode("ascii"), 16)
         except ValueError as exc:
             raise ValueError("invalid chunk size") from exc
+        if size < 0:
+            raise ValueError("invalid chunk size")
         if size == 0:
             while True:
                 trailer = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout=10)
@@ -178,7 +181,7 @@ async def _read_request(
     request_line, headers = parsed
 
     parts = request_line.split()
-    if len(parts) != 3 or not _is_http_version(parts[2]):
+    if len(parts) != 3 or not is_http_version(parts[2]):
         return None, HTTPStatus.BAD_REQUEST
     method, target, _version = parts
     if method.upper() != "POST":
@@ -232,14 +235,6 @@ async def _read_request(
         ),
         None,
     )
-
-
-def _is_http_version(value: str) -> bool:
-    prefix, separator, version = value.partition("/")
-    if prefix != "HTTP" or separator != "/":
-        return False
-    major, dot, minor = version.partition(".")
-    return bool(major and dot == "." and minor and major.isdigit() and minor.isdigit())
 
 
 def _apply_template(

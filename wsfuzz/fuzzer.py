@@ -168,18 +168,16 @@ def _load_transport_mode(metadata: dict[str, str]) -> str | None:
     return None
 
 
-def _load_scenario_metadata(
-    metadata: dict[str, str],
-    path: Path,
-) -> tuple[Path | None, int | None]:
+def _metadata_scenario_path(metadata: dict[str, str]) -> Path | None:
     scenario_path = metadata.get("scenario_path")
+    return Path(scenario_path) if scenario_path else None
+
+
+def _metadata_fuzz_ordinal(metadata: dict[str, str], path: Path) -> int | None:
     fuzz_ordinal = metadata.get("scenario_fuzz_ordinal")
-    return (
-        Path(scenario_path) if scenario_path else None,
-        _parse_non_negative_int(fuzz_ordinal, "scenario_fuzz_ordinal", path)
-        if fuzz_ordinal is not None
-        else None,
-    )
+    if fuzz_ordinal is None:
+        return None
+    return _parse_non_negative_int(fuzz_ordinal, "scenario_fuzz_ordinal", path)
 
 
 def _load_mode_field(metadata: dict[str, str], key: str) -> str | None:
@@ -242,7 +240,7 @@ def _resolve_replay_scenario_path(
     snapshot_path = crash_file.with_suffix(".scenario.json")
     if snapshot_path.is_file():
         return snapshot_path
-    scenario_path, _ = _load_scenario_metadata(metadata, crash_file)
+    scenario_path = _metadata_scenario_path(metadata)
     if scenario_path is not None:
         if scenario_path.is_absolute():
             return scenario_path
@@ -368,7 +366,7 @@ async def _replay_scenario_kind(
     payload: bytes,
     opts: ConnectOpts | None,
 ) -> TransportResult:
-    _, fuzz_ordinal = _load_scenario_metadata(metadata, path)
+    fuzz_ordinal = _metadata_fuzz_ordinal(metadata, path)
     scenario_source = _resolve_replay_scenario_path(path, config.scenario, metadata)
     if scenario_source is None:
         raise ValueError("scenario replay metadata is missing scenario_path")

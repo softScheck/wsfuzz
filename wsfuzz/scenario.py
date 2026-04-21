@@ -22,6 +22,7 @@ from wsfuzz.transport import (
     handle_close,
     is_http_token,
     make_connect_opts,
+    make_insecure_ssl_context,
     open_connection,
 )
 
@@ -335,27 +336,18 @@ def _validate_dict_schema(
             and data[key] is not None
             and not isinstance(data[key], expected_type)
         ):
-            type_names = (
-                "an object"
-                if expected_type is dict
-                else "an array"
-                if expected_type is list
-                else "a string"
-                if expected_type is str
-                else str(expected_type)
+            types = (
+                expected_type if isinstance(expected_type, tuple) else (expected_type,)
             )
-            if isinstance(expected_type, tuple):
-                type_names = " or ".join(
-                    "an object"
-                    if t is dict
-                    else "an array"
-                    if t is list
-                    else "a string"
-                    if t is str
-                    else str(t)
-                    for t in expected_type
-                )
+            type_names = " or ".join(_type_label(t) for t in types)
             raise ScenarioError(f"{path}.{key} must be {type_names}")
+
+
+_TYPE_LABELS: dict[type, str] = {dict: "an object", list: "an array", str: "a string"}
+
+
+def _type_label(t: type) -> str:
+    return _TYPE_LABELS.get(t, str(t))
 
 
 def _validate_connect(connect: dict[str, Any]) -> None:
@@ -380,8 +372,6 @@ def _validate_connect(connect: dict[str, Any]) -> None:
                 "scenario connect.origin must not contain control characters"
             )
     if "headers" in connect:
-        if not isinstance(connect["headers"], dict):
-            raise ScenarioError("scenario connect.headers must be an object")
         _validate_header_mapping(connect["headers"], "scenario connect.headers")
 
 
@@ -394,7 +384,7 @@ def _validate_pre_http(pre_http: dict[str, Any]) -> None:
             "url": str,
             "method": str,
             "headers": dict,
-            "body": (dict, list, str, type(None)),
+            "body": (dict, list, str),
             "capture": dict,
         },
         path="scenario pre_http",
@@ -410,13 +400,9 @@ def _validate_pre_http(pre_http: dict[str, Any]) -> None:
         raise ScenarioError("scenario pre_http.url must be an http:// or https:// URL")
     _validate_url_authority(pre_http_url, "scenario pre_http.url")
     if "headers" in pre_http:
-        if not isinstance(pre_http["headers"], dict):
-            raise ScenarioError("scenario pre_http.headers must be an object")
         _validate_header_mapping(pre_http["headers"], "scenario pre_http.headers")
     if "capture" in pre_http:
         capture = pre_http["capture"]
-        if not isinstance(capture, dict):
-            raise ScenarioError("scenario pre_http.capture must be an object")
         unsupported_capture = set(capture) - {"json", "headers"}
         if unsupported_capture:
             raise ScenarioError(
@@ -436,12 +422,6 @@ def _validate_pre_http(pre_http: dict[str, Any]) -> None:
             raise ScenarioError(
                 "scenario pre_http.expect_status must be between 100 and 599"
             )
-    if (
-        "body" in pre_http
-        and pre_http["body"] is not None
-        and not isinstance(pre_http["body"], (dict, list, str))
-    ):
-        raise ScenarioError("scenario pre_http body must be a string, list, or object")
 
 
 def _validate_header_mapping(headers: Any, context: str) -> None:
@@ -802,7 +782,7 @@ def _make_pre_http_ssl_context(
     if urlsplit(url).scheme != "https":
         return None
     if opts and opts.insecure:
-        return ssl._create_unverified_context()
+        return make_insecure_ssl_context()
     try:
         return ssl.create_default_context(cafile=opts.ca_file if opts else None)
     except OSError as exc:
@@ -971,6 +951,8 @@ def _split_fuzz_step(step: Any) -> tuple[Any, Any]:
 
 
 def _is_fuzz_control_object(step: Any) -> bool:
+    # A dict with only "template" is a regular message template, not a control object.
+    # Requires at least "name" or "fallback" to distinguish from message payloads.
     if not isinstance(step, dict):
         return False
     keys = set(step)

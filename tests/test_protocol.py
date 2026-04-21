@@ -135,6 +135,22 @@ class TestParseCloseFrame:
         assert _parse_close_frame(b"\x88") is None
         assert _parse_close_frame(b"") is None
 
+    def test_elapsed_ms_propagated(self):
+        frame = build_frame(
+            struct.pack("!H", 1002) + b"error", opcode=OP_CLOSE, mask=False
+        )
+        result = _parse_close_frame(frame, elapsed_ms=42.5)
+        assert result is not None
+        assert result.duration_ms == 42.5
+
+    def test_elapsed_ms_defaults_to_zero(self):
+        frame = build_frame(
+            struct.pack("!H", 1003) + b"error", opcode=OP_CLOSE, mask=False
+        )
+        result = _parse_close_frame(frame)
+        assert result is not None
+        assert result.duration_ms == 0.0
+
 
 class TestProtocolViolations:
     """Send protocol-violating frames to the echo server.
@@ -148,67 +164,60 @@ class TestProtocolViolations:
         """RFC 6455 5.2: opcodes 3-7 and 0xB-0xF are reserved."""
         frame = build_frame(b"test", opcode=0x03, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        # Server should reject with protocol error or close
-        assert result.error is not None or result.response is not None
+        assert result.error is not None
 
     def test_all_reserved_opcodes(self, echo_server):
-        """Test all reserved opcodes are handled."""
+        """All reserved opcodes must be rejected by the server."""
         reserved = [3, 4, 5, 6, 7, 0xB, 0xC, 0xD, 0xE, 0xF]
         for opcode in reserved:
             frame = build_frame(b"x", opcode=opcode, mask=True)
             result = asyncio.run(send_raw(echo_server, frame, 2.0))
-            # Should not hang or crash — server rejects cleanly
-            assert isinstance(result, TransportResult), (
-                f"opcode {opcode:#x} caused issue"
-            )
+            assert result.error is not None, f"opcode {opcode:#x} was not rejected"
 
     def test_unmasked_client_frame_rejected(self, echo_server):
         """RFC 6455 5.1: client frames MUST be masked."""
         frame = build_frame(b"hello", opcode=OP_TEXT, mask=False)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        # Server should reject — unmasked client frames are a protocol error
-        assert result.error is not None or result.response is not None
+        assert result.error is not None
 
     def test_rsv_bits_without_extension(self, echo_server):
         """RFC 6455 5.2: RSV bits must be 0 unless extension is negotiated."""
         frame = build_frame(b"test", opcode=OP_TEXT, mask=True, rsv1=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_oversized_control_frame(self, echo_server):
         """RFC 6455 5.5: control frames MUST have payload <= 125 bytes."""
         payload = b"A" * 200
         frame = build_frame(payload, opcode=OP_PING, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_fragmented_control_frame(self, echo_server):
         """RFC 6455 5.5: control frames MUST NOT be fragmented."""
         frame = build_frame(b"ping", opcode=OP_PING, fin=False, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_continuation_without_start(self, echo_server):
         """RFC 6455 5.4: continuation frame without initial frame."""
         frame = build_frame(b"orphan", opcode=OP_CONTINUATION, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_invalid_utf8_in_text_frame(self, echo_server):
         """RFC 6455 5.6: text frames must contain valid UTF-8."""
-        # Deliberately invalid UTF-8: 0xFF is never valid
         payload = b"\xff\xfe\x80\x81invalid"
         frame = build_frame(payload, opcode=OP_TEXT, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_close_frame_invalid_code(self, echo_server):
         """RFC 6455 7.4.1: close codes 0-999 are not used."""
-        # Close frame payload: 2-byte status code + reason
         payload = struct.pack("!H", 999) + b"bad code"
         frame = build_frame(payload, opcode=OP_CLOSE, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_close_frame_reserved_code(self, echo_server):
         """RFC 6455 7.4.1: codes 1004, 1005, 1006 are reserved."""
@@ -216,22 +225,22 @@ class TestProtocolViolations:
             payload = struct.pack("!H", code) + b"reserved"
             frame = build_frame(payload, opcode=OP_CLOSE, mask=True)
             result = asyncio.run(send_raw(echo_server, frame, 2.0))
-            assert isinstance(result, TransportResult), f"close code {code}"
+            assert result.error is not None, f"close code {code} was not rejected"
 
     def test_zero_length_close_code(self, echo_server):
         """Close frame with 1 byte (invalid: must be 0 or >= 2 bytes)."""
         payload = b"\x03"  # 1 byte — not a valid close payload
         frame = build_frame(payload, opcode=OP_CLOSE, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_valid_frame_still_works(self, echo_server):
-        """Sanity check: a valid masked binary frame echoes correctly."""
+        """Sanity check: a valid masked text frame echoes correctly."""
         frame = build_frame(b"hello", opcode=OP_TEXT, mask=True)
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
-        # Should get a response containing our data
         assert result.error is None
-        assert result.response is not None
+        # Raw mode returns full frame bytes — payload embedded after header
+        assert b"hello" in result.response
 
     def test_valid_frame_still_works_over_wss(self, tls_echo_server):
         frame = build_frame(b"secure hello", opcode=OP_TEXT, mask=True)
@@ -244,7 +253,7 @@ class TestProtocolViolations:
             )
         )
         assert result.error is None
-        assert result.response is not None
+        assert b"secure hello" in result.response
 
     def test_valid_frame_still_works_over_wss_insecure(self, tls_echo_server):
         frame = build_frame(b"secure hello", opcode=OP_TEXT, mask=True)
@@ -257,7 +266,7 @@ class TestProtocolViolations:
             )
         )
         assert result.error is None
-        assert result.response is not None
+        assert b"secure hello" in result.response
 
     def test_raw_handshake_preserves_path_params_and_query_string(self):
         captured: dict[str, bytes] = {}
@@ -298,7 +307,7 @@ class TestProtocolViolations:
                     frame,
                     2.0,
                 )
-                assert isinstance(result, TransportResult)
+                assert result is not None
 
         asyncio.run(run_test())
         assert b"GET /echo;v=1?token=abc&mode=test HTTP/1.1" in captured["request"]
@@ -627,24 +636,8 @@ class TestProtocolViolations:
 class TestRawFuzzerMode:
     """Test the fuzzer's --raw mode against the echo server."""
 
-    def test_raw_mode_runs(self, echo_server, tmp_path, capsys):
-        from wsfuzz.fuzzer import FuzzConfig, run
-
-        config = FuzzConfig(
-            target=echo_server,
-            iterations=20,
-            max_size=100,
-            timeout=2.0,
-            log_dir=tmp_path / "crashes",
-            raw=True,
-        )
-        run(config)
-        out = capsys.readouterr().out
-        assert "mode:        raw" in out
-        assert "iterations: 20" in out
-
-    def test_raw_mode_detects_protocol_errors(self, echo_server, tmp_path, capsys):
-        """Raw mode should find protocol errors via invalid opcodes/flags."""
+    def test_raw_mode_produces_crashes(self, echo_server, tmp_path):
+        """Raw mode with mutated frames should trigger protocol errors."""
         from wsfuzz.fuzzer import FuzzConfig, run
 
         config = FuzzConfig(
@@ -656,13 +649,12 @@ class TestRawFuzzerMode:
             raw=True,
         )
         run(config)
-        capsys.readouterr()
         crash_files = list((tmp_path / "crashes").glob("crash_*.bin"))
         # ~91% of frames get reserved opcodes, triggering close code 1002
         assert len(crash_files) > 0, "raw mode should detect protocol errors"
 
-    def test_raw_mode_with_handshake_fuzzing(self, echo_server, tmp_path, capsys):
-        """--fuzz-handshake should randomize WS upgrade headers."""
+    def test_raw_mode_with_handshake_fuzzing(self, echo_server, tmp_path):
+        """--fuzz-handshake should produce crashes from rejected handshakes."""
         from wsfuzz.fuzzer import FuzzConfig, run
 
         config = FuzzConfig(
@@ -673,10 +665,15 @@ class TestRawFuzzerMode:
             log_dir=tmp_path / "crashes",
             raw=True,
             fuzz_handshake=True,
+            crash_dedup=False,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "handshake:   fuzz" in out
+        # Handshake fuzzing with random versions/extensions should trigger
+        # handshake_failed errors or protocol errors on most iterations
+        crash_dir = tmp_path / "crashes"
+        assert crash_dir.exists()
+        crash_files = list(crash_dir.glob("crash_*.bin"))
+        assert len(crash_files) > 0, "handshake fuzzing should produce crashes"
 
 
 class TestPayloadLengthMismatch:
@@ -687,16 +684,19 @@ class TestPayloadLengthMismatch:
     """
 
     def test_fake_large_length_small_payload(self, echo_server):
-        """Declare 65535 bytes but send only 5."""
+        """Declare 65535 bytes but send only 5 — server should error or timeout."""
         frame = build_frame(b"hello", opcode=OP_TEXT, mask=True, fake_length=65535)
         result = asyncio.run(send_raw(echo_server, frame, 2.0))
-        assert isinstance(result, TransportResult)
+        assert result.error is not None
 
     def test_fake_zero_length(self, echo_server):
-        """Declare 0 bytes but send actual payload."""
+        """Declare 0 bytes but send actual payload — server sees empty message."""
         frame = build_frame(b"surprise", opcode=OP_BINARY, mask=True, fake_length=0)
         result = asyncio.run(send_raw(echo_server, frame, 2.0))
-        assert isinstance(result, TransportResult)
+        # Server reads 0 bytes per header, ignores trailing data.
+        # Either errors on the trailing bytes or echoes the empty payload.
+        if result.error is None:
+            assert result.response == b"\x82\x00"  # binary frame, 0-byte payload
 
     def test_frame_header_encodes_fake_length(self):
         """Verify build_frame uses fake_length in the header."""
@@ -719,18 +719,14 @@ class TestCSWSH:
     def test_check_origin_with_valid_origin(self, echo_server):
         """Same-origin connection should succeed."""
         result = asyncio.run(check_origin(echo_server, "http://127.0.0.1", 2.0))
-        # Echo server doesn't validate Origin, so this succeeds
-        assert (
-            result.error is None
-            or result.close_code is None
-            or result.close_code < 1002
-        )
+        # Echo server doesn't validate Origin — same-origin accepted
+        assert result.error is None
 
     def test_check_origin_with_evil_origin(self, echo_server):
         """Cross-origin connection — echo server accepts (it's vulnerable)."""
         result = asyncio.run(check_origin(echo_server, "http://evil.example.com", 2.0))
-        # Our test echo server doesn't validate Origin — this is expected
-        assert isinstance(result, TransportResult)
+        # Echo server doesn't validate Origin — cross-origin also accepted
+        assert result.error is None
 
     def test_custom_headers_in_raw_mode(self, echo_server):
         """Custom headers should be included in the raw handshake."""
@@ -739,7 +735,8 @@ class TestCSWSH:
             headers={"Cookie": "session=abc123"}, origin="http://test.local"
         )
         result = asyncio.run(send_raw(echo_server, frame, 2.0, opts))
-        assert isinstance(result, TransportResult)
+        assert result.error is None
+        assert b"test" in result.response
 
     def test_custom_headers_in_normal_mode(self, echo_server):
         """Custom headers should be passed to websockets.connect."""

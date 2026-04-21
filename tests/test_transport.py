@@ -8,7 +8,9 @@ from wsfuzz.raw import build_frame, send_raw
 from wsfuzz.transport import (
     ConnectOpts,
     TransportResult,
+    is_http_version,
     make_connect_opts,
+    make_insecure_ssl_context,
     send_payload,
     validate_ws_uri,
 )
@@ -157,8 +159,9 @@ class TestSendPayload:
     def test_binary_payload_with_text_mode(self, echo_server):
         payload = b"\xff\xfe\xfd"  # invalid UTF-8
         result = asyncio.run(send_payload(echo_server + "/echo", payload, "text", 5.0))
-        # Should not crash — decode with errors="replace"
-        assert isinstance(result, TransportResult)
+        # Should not crash — decode with errors="replace", echo server returns it
+        assert result.error is None
+        assert result.response is not None
 
     def test_null_bytes_binary(self, echo_server):
         payload = b"\x00" * 100
@@ -234,3 +237,46 @@ class TestSendPayload:
         )
 
         assert result.error_type == "transport_config"
+
+
+class TestIsHttpVersion:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "HTTP/1.0",
+            "HTTP/1.1",
+            "HTTP/2.0",
+            "HTTP/0.9",
+        ],
+    )
+    def test_accepts_valid_versions(self, value):
+        assert is_http_version(value) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "HTTP/",
+            "HTTP/1",
+            "HTTP/1.",
+            "HTTP/.1",
+            "http/1.1",
+            "FTP/1.0",
+            "1.1",
+            "HTTP/a.1",
+            "HTTP/1.b",
+            "HTTP 1.1",
+        ],
+    )
+    def test_rejects_invalid_versions(self, value):
+        assert is_http_version(value) is False
+
+
+class TestMakeInsecureSslContext:
+    def test_returns_context_with_no_verification(self):
+        import ssl
+
+        ctx = make_insecure_ssl_context()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.check_hostname is False
+        assert ctx.verify_mode == ssl.CERT_NONE

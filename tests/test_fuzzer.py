@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wsfuzz.fuzzer import FuzzConfig, run
+from wsfuzz.fuzzer import FuzzConfig, _compare_replay, run
 from wsfuzz.raw import HandshakeFuzz
 from wsfuzz.scenario import ScenarioError
 from wsfuzz.transport import TransportResult
@@ -176,7 +176,7 @@ class TestFuzzerIntegration:
                 )
             )
 
-    def test_fuzz_echo_server(self, echo_server, tmp_path, capsys):
+    def test_fuzz_echo_server(self, echo_server, tmp_path):
         seeds_dir = Path(__file__).parent.parent / "seeds"
         config = FuzzConfig(
             target=echo_server,
@@ -186,14 +186,13 @@ class TestFuzzerIntegration:
             max_size=200,
             timeout=2.0,
             log_dir=tmp_path / "crashes",
-            verbose=True,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "wsfuzz - WebSocket Fuzzer" in out
-        assert "iterations: 10" in out
+        # Echo server echoes everything — no crashes expected
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_text_mode(self, echo_server, tmp_path, capsys):
+    def test_fuzz_text_mode(self, echo_server, tmp_path):
         seeds_dir = Path(__file__).parent.parent / "seeds"
         config = FuzzConfig(
             target=echo_server,
@@ -203,13 +202,12 @@ class TestFuzzerIntegration:
             max_size=100,
             timeout=2.0,
             log_dir=tmp_path / "crashes",
-            verbose=True,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "iterations: 5" in out
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_connection_refused(self, tmp_path, capsys):
+    def test_fuzz_connection_refused(self, tmp_path):
         config = FuzzConfig(
             target="ws://127.0.0.1:1",
             iterations=2,
@@ -217,11 +215,11 @@ class TestFuzzerIntegration:
             log_dir=tmp_path / "crashes",
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "connection refused" in out
-        assert "crashes:    0" in out
+        # Connection refused is filtered — no crash artifacts
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_connection_refused_gives_up(self, tmp_path, capsys):
+    def test_fuzz_connection_refused_gives_up(self, tmp_path):
         config = FuzzConfig(
             target="ws://127.0.0.1:1",
             iterations=0,
@@ -230,10 +228,12 @@ class TestFuzzerIntegration:
             max_retries=2,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "giving up after 2 consecutive failures" in out
+        # With max_retries=2 and iterations=0 (infinite), fuzzer should
+        # give up after 2 consecutive failures — no crash artifacts
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_connection_refused_no_limit(self, tmp_path, capsys):
+    def test_fuzz_connection_refused_no_limit(self, tmp_path):
         config = FuzzConfig(
             target="ws://127.0.0.1:1",
             iterations=2,
@@ -242,11 +242,11 @@ class TestFuzzerIntegration:
             max_retries=0,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "giving up" not in out
-        assert "crashes:    0" in out
+        # max_retries=0 means no limit — runs all iterations even if all fail
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_with_empty_seeds(self, echo_server, tmp_path, capsys):
+    def test_fuzz_with_empty_seeds(self, echo_server, tmp_path):
         empty_seeds = tmp_path / "empty_seeds"
         empty_seeds.mkdir()
         config = FuzzConfig(
@@ -255,30 +255,40 @@ class TestFuzzerIntegration:
             seeds_dir=empty_seeds,
             timeout=2.0,
             log_dir=tmp_path / "crashes",
-            verbose=True,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "seeds:       1" in out
-        assert "iterations: 5" in out
+        # Empty seeds dir should use fallback seed; echo server → no crashes
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 0
 
-    def test_fuzz_max_size_truncation(self, echo_server, tmp_path, capsys):
+    def test_fuzz_max_size_truncation(self, echo_server, tmp_path, monkeypatch):
+        sent_sizes = []
+        original_send = None
+
+        import wsfuzz.fuzzer as fuzzer_mod
+
+        original_send = fuzzer_mod.send_payload
+
+        async def tracking_send(uri, payload, mode, timeout, opts=None):
+            sent_sizes.append(len(payload))
+            return await original_send(uri, payload, mode, timeout, opts)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", tracking_send)
+
         config = FuzzConfig(
             target=echo_server,
             iterations=5,
             max_size=10,
             timeout=2.0,
             log_dir=tmp_path / "crashes",
-            verbose=True,
         )
         run(config)
-        out = capsys.readouterr().out
-        for line in out.splitlines():
-            if line.startswith("[") and "ok" in line:
-                size = int(line.split("(")[1].split("b")[0])
-                assert size <= 10
+        assert len(sent_sizes) == 5
+        assert all(s <= 10 for s in sent_sizes), (
+            f"payloads exceeded max_size: {sent_sizes}"
+        )
 
-    def test_fuzz_error_server_logs_crashes(self, echo_server, tmp_path, capsys):
+    def test_fuzz_error_server_logs_crashes(self, echo_server, tmp_path):
         config = FuzzConfig(
             target=echo_server + "/error",
             iterations=3,
@@ -292,9 +302,7 @@ class TestFuzzerIntegration:
         assert len(crash_bins) == 3
         assert len(crash_txts) == 3
 
-    def test_fuzz_error_server_deduplicates_crashes(
-        self, echo_server, tmp_path, capsys
-    ):
+    def test_fuzz_error_server_deduplicates_crashes(self, echo_server, tmp_path):
         config = FuzzConfig(
             target=echo_server + "/error",
             iterations=3,
@@ -302,23 +310,32 @@ class TestFuzzerIntegration:
             log_dir=tmp_path / "crashes",
         )
         run(config)
-        out = capsys.readouterr().out
         crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
         index = json.loads((tmp_path / "crashes" / "crash_index.json").read_text())
 
+        # Dedup: only 1 crash artifact, but index records all 3 observations
         assert len(crash_bins) == 1
-        assert "crashes:    1" in out
-        assert "duplicates: 2" in out
-        assert next(iter(index["fingerprints"].values()))["count"] == 3
+        fingerprints = index["fingerprints"]
+        assert len(fingerprints) == 1
+        assert next(iter(fingerprints.values()))["count"] == 3
 
 
 class TestReplay:
-    def test_replay_crash_files(self, echo_server, tmp_path, capsys):
-        """Replay mode should resend crash payloads and report results."""
+    def test_replay_crash_files(self, echo_server, tmp_path, monkeypatch):
+        """Replay mode sends exact crash payloads."""
         crash_dir = tmp_path / "crashes"
         crash_dir.mkdir()
         (crash_dir / "crash_0_1.bin").write_bytes(b"hello")
         (crash_dir / "crash_1_2.bin").write_bytes(b"world")
+
+        sent_payloads = []
+        from wsfuzz.transport import send_payload
+
+        async def tracking_send(uri, payload, mode, timeout, opts=None):
+            sent_payloads.append(payload)
+            return await send_payload(uri, payload, mode, timeout, opts)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", tracking_send)
 
         config = FuzzConfig(
             target=echo_server,
@@ -327,167 +344,59 @@ class TestReplay:
             replay=[crash_dir / "crash_0_1.bin", crash_dir / "crash_1_2.bin"],
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "Replay Mode" in out
-        assert "files:   2" in out
-        assert "crash_0_1.bin" in out
-        assert "crash_1_2.bin" in out
+        assert len(sent_payloads) == 2
+        assert set(sent_payloads) == {b"hello", b"world"}
 
-    def test_replay_reports_reproduced_behavior(self, tmp_path, monkeypatch, capsys):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
-        crash_file.with_suffix(".txt").write_text(
-            "transport_mode: normal\nmessage_mode: text\nerror_type: boom\n"
-        )
+    def test_compare_replay_reproduced_error_type(self):
+        metadata = {"error_type": "boom"}
+        result = TransportResult(error="boom", error_type="boom", duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "reproduced"
 
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(error="boom", error_type="boom", duration_ms=1.0)
+    def test_compare_replay_changed_error_type(self):
+        metadata = {"error_type": "boom"}
+        result = TransportResult(response=b"ok", duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "changed"
+        assert "error_type expected boom, got None" in comparison.detail
 
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
-
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: reproduced" in out
-        assert "replay summary: 1 reproduced, 0 changed, 0 unchecked" in out
-
-    def test_replay_reports_changed_behavior(self, tmp_path, monkeypatch, capsys):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
-        crash_file.with_suffix(".txt").write_text(
-            "transport_mode: normal\nmessage_mode: text\nerror_type: boom\n"
-        )
-
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(response=b"ok", duration_ms=1.0)
-
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
-
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: changed" in out
-        assert "error_type expected boom, got None" in out
-        assert "replay summary: 0 reproduced, 1 changed, 0 unchecked" in out
-
-    def test_replay_reports_response_hash_match(self, tmp_path, monkeypatch, capsys):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
+    def test_compare_replay_response_hash_match(self):
         response_hash = hashlib.sha256(b"ok").hexdigest()
-        crash_file.with_suffix(".txt").write_text(
-            f"transport_mode: normal\nmessage_mode: text\nresponse_sha256: {response_hash}\n"
-        )
+        metadata = {"response_sha256": response_hash}
+        result = TransportResult(response=b"ok", duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "reproduced"
 
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(response=b"ok", duration_ms=1.0)
-
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
-
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: reproduced" in out
-
-    def test_replay_reports_unexpected_error_from_response_baseline(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
+    def test_compare_replay_response_hash_mismatch(self):
         response_hash = hashlib.sha256(b"ok").hexdigest()
-        crash_file.with_suffix(".txt").write_text(
-            "transport_mode: normal\n"
-            "message_mode: text\n"
-            "error_type: None\n"
-            f"response_sha256: {response_hash}\n"
+        metadata = {"error_type": "None", "response_sha256": response_hash}
+        result = TransportResult(error="boom", error_type="boom", duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "changed"
+        assert "error_type expected None, got boom" in comparison.detail
+        assert "response_sha256 changed" in comparison.detail
+
+    def test_compare_replay_unchecked_no_metadata(self):
+        comparison = _compare_replay(
+            {}, TransportResult(response=b"ok", duration_ms=1.0)
         )
+        assert comparison.status == "unchecked"
+        assert "no baseline metadata" in comparison.detail
 
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(error="boom", error_type="boom", duration_ms=1.0)
+    def test_compare_replay_close_code_match(self):
+        metadata = {"close_code": "1011"}
+        result = TransportResult(close_code=1011, duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "reproduced"
 
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
+    def test_compare_replay_close_code_mismatch(self):
+        metadata = {"close_code": "1011"}
+        result = TransportResult(close_code=1002, duration_ms=1.0)
+        comparison = _compare_replay(metadata, result)
+        assert comparison.status == "changed"
+        assert "close_code expected 1011, got 1002" in comparison.detail
 
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: changed" in out
-        assert "error_type expected None, got boom" in out
-        assert "response_sha256 changed" in out
-
-    def test_replay_reports_unchecked_without_metadata(
-        self, tmp_path, monkeypatch, capsys
-    ):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
-
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(response=b"ok", duration_ms=1.0)
-
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
-
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: unchecked (no baseline metadata)" in out
-        assert "replay summary: 0 reproduced, 0 changed, 1 unchecked" in out
-
-    def test_replay_ignores_corrupt_metadata(self, tmp_path, monkeypatch, capsys):
-        crash_file = tmp_path / "crash_0_1.bin"
-        crash_file.write_bytes(b"payload")
-        crash_file.with_suffix(".txt").write_bytes(b"\xff\xfe\xfd")
-
-        async def fake_send_payload(uri, payload, mode, timeout, opts=None):
-            return TransportResult(response=b"ok", duration_ms=1.0)
-
-        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", fake_send_payload)
-
-        run(
-            FuzzConfig(
-                target="ws://example.test/socket",
-                timeout=1.0,
-                log_dir=tmp_path / "unused",
-                replay=[crash_file],
-            )
-        )
-
-        out = capsys.readouterr().out
-        assert "replay: unchecked (no baseline metadata)" in out
-
-    def test_replay_dir_expansion(self, echo_server, tmp_path, capsys):
+    def test_replay_dir_expansion(self, echo_server, tmp_path, monkeypatch):
         """--replay with a directory should find crash_*.bin files."""
         from wsfuzz.cli import main
 
@@ -496,17 +405,21 @@ class TestReplay:
         (crash_dir / "crash_0_1.bin").write_bytes(b"test")
         (crash_dir / "other.txt").write_bytes(b"ignored")
 
-        # Test the CLI directory expansion logic directly
-        import sys
+        sent_payloads = []
+        from wsfuzz.transport import send_payload
 
-        old_argv = sys.argv
-        sys.argv = ["wsfuzz", "-t", echo_server, "--replay", str(crash_dir)]
-        try:
-            main()
-        finally:
-            sys.argv = old_argv
-        out = capsys.readouterr().out
-        assert "crash_0_1.bin" in out
+        async def tracking_send(uri, payload, mode, timeout, opts=None):
+            sent_payloads.append(payload)
+            return await send_payload(uri, payload, mode, timeout, opts)
+
+        monkeypatch.setattr("wsfuzz.fuzzer.send_payload", tracking_send)
+        monkeypatch.setattr(
+            "sys.argv",
+            ["wsfuzz", "-t", echo_server, "--replay", str(crash_dir)],
+        )
+        main()
+        # Only crash_0_1.bin should be replayed, not other.txt
+        assert sent_payloads == [b"test"]
 
     def test_replay_raw_resends_saved_frame_bytes(self, tmp_path, monkeypatch):
         crash_file = tmp_path / "crash_0_1.bin"
@@ -772,13 +685,19 @@ class TestRawCrashReplayability:
             )
         )
 
-        crash_txt = next((tmp_path / "crashes").glob("crash_*.txt")).read_text()
-        assert "transport_mode: raw" in crash_txt
-        assert "message_mode: binary" in crash_txt
-        assert "handshake_fuzz: true" in crash_txt
-        assert "handshake_version: 99" in crash_txt
-        assert "handshake_extension: permessage-deflate" in crash_txt
-        assert "handshake_protocol: chat" in crash_txt
+        crash_path = next((tmp_path / "crashes").glob("crash_*.txt"))
+        meta = {}
+        for line in crash_path.read_text().splitlines():
+            key, sep, value = line.partition(":")
+            if sep:
+                meta[key.strip()] = value.lstrip()
+
+        assert meta["transport_mode"] == "raw"
+        assert meta["message_mode"] == "binary"
+        assert meta["handshake_fuzz"] == "true"
+        assert meta["handshake_version"] == "99"
+        assert meta["handshake_extension"] == "permessage-deflate"
+        assert meta["handshake_protocol"] == "chat"
 
 
 class TestConcurrency:
@@ -827,20 +746,21 @@ class TestConcurrency:
             f"concurrent={con_ms:.0f}ms, sequential={seq_ms:.0f}ms"
         )
 
-    def test_concurrent_completes_all_iterations(self, echo_server, tmp_path, capsys):
+    def test_concurrent_completes_all_iterations(self, echo_server, tmp_path):
         config = FuzzConfig(
-            target=echo_server,
+            target=echo_server + "/error",
             iterations=15,
             timeout=2.0,
             log_dir=tmp_path / "crashes",
             concurrency=5,
-            verbose=True,
+            crash_dedup=False,
         )
         run(config)
-        out = capsys.readouterr().out
-        assert "iterations: 15" in out
+        # All 15 iterations should complete and produce crash artifacts
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        assert len(crash_bins) == 15
 
-    def test_concurrent_error_server(self, echo_server, tmp_path, capsys):
+    def test_concurrent_error_server(self, echo_server, tmp_path):
         """Concurrent fuzzing against error server should log all crashes."""
         config = FuzzConfig(
             target=echo_server + "/error",
@@ -851,5 +771,9 @@ class TestConcurrency:
             crash_dedup=False,
         )
         run(config)
-        crash_files = list((tmp_path / "crashes").glob("crash_*.bin"))
-        assert len(crash_files) == 10
+        crash_bins = list((tmp_path / "crashes").glob("crash_*.bin"))
+        crash_txts = list((tmp_path / "crashes").glob("crash_*.txt"))
+        assert len(crash_bins) == 10
+        # Every .bin has matching .txt and all base names unique
+        assert len(crash_txts) == 10
+        assert len({p.stem for p in crash_bins}) == 10

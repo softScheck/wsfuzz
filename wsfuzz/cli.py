@@ -84,9 +84,11 @@ def _validate_port_and_concurrency(args, parser) -> None:
 
 
 def _validate_origin(args, parser) -> None:
-    if args.origin and any(char in args.origin for char in "\r\n"):
+    if not args.origin:
+        return
+    if any(char in args.origin for char in "\r\n"):
         parser.error("--origin must not contain newlines")
-    if args.origin and contains_control_chars(args.origin):
+    if contains_control_chars(args.origin):
         parser.error("--origin must not contain control characters")
 
 
