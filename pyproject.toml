@@ -1,6 +1,6 @@
 [project]
 name = "wsfuzz"
-version = "0.4.2"
+version = "0.4.3"
 description = "WebSocket fuzzer using Radamsa for input mutation"
 requires-python = ">=3.12"
 dependencies = [
