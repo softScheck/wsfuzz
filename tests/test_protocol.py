@@ -240,6 +240,7 @@ class TestProtocolViolations:
         result = asyncio.run(send_raw(echo_server, frame, 5.0))
         assert result.error is None
         # Raw mode returns full frame bytes — payload embedded after header
+        assert result.response is not None
         assert b"hello" in result.response
 
     def test_valid_frame_still_works_over_wss(self, tls_echo_server):
@@ -253,6 +254,7 @@ class TestProtocolViolations:
             )
         )
         assert result.error is None
+        assert result.response is not None
         assert b"secure hello" in result.response
 
     def test_valid_frame_still_works_over_wss_insecure(self, tls_echo_server):
@@ -266,6 +268,7 @@ class TestProtocolViolations:
             )
         )
         assert result.error is None
+        assert result.response is not None
         assert b"secure hello" in result.response
 
     def test_raw_handshake_preserves_path_params_and_query_string(self):
@@ -736,6 +739,7 @@ class TestCSWSH:
         )
         result = asyncio.run(send_raw(echo_server, frame, 2.0, opts))
         assert result.error is None
+        assert result.response is not None
         assert b"test" in result.response
 
     def test_custom_headers_in_normal_mode(self, echo_server):

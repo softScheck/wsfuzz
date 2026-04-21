@@ -356,8 +356,12 @@ class TestMakeHandshakeFuzz:
 
     def test_produces_variety(self):
         """Multiple calls should produce different configurations."""
-        results = {make_handshake_fuzz(enabled=True).version for _ in range(20)}
-        assert len(results) > 1
+        versions = set()
+        for _ in range(20):
+            fuzz = make_handshake_fuzz(enabled=True)
+            assert fuzz is not None
+            versions.add(fuzz.version)
+        assert len(versions) > 1
 
 
 # ---------------------------------------------------------------------------

@@ -545,6 +545,7 @@ class TestSerializeMessageEdgeCases:
 
     def test_float_serializes_to_json_string(self):
         msg = _serialize_message(3.14, "text", {}, None)
+        assert isinstance(msg, str)
         assert "3.14" in msg
 
     def test_dict_serializes_to_compact_json_text_mode(self):

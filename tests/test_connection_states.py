@@ -302,6 +302,7 @@ class TestNormalOperationParity:
         assert r.error is None
         assert r.connection_refused is False
         # Raw mode returns full frame bytes — payload embedded after header
+        assert r.response is not None
         assert b"hello" in r.response
 
 

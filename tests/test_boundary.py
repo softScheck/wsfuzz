@@ -359,6 +359,7 @@ class TestCrashMetadataPathTraversal:
         logger = CrashLogger(tmp_path)
         result = TransportResult(error="err", error_type="SomeError")
         logged = logger.log_crash(0, b"x", result, 0, 1)
+        assert logged.base_name is not None
         assert "/" not in logged.base_name
         assert "\\" not in logged.base_name
 
